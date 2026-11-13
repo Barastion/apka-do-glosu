@@ -14,6 +14,10 @@ const TEXT_MODEL = process.env.TEXT_MODEL || 'gemini-3.8-flash';
 const TTS_MODELS = [process.env.TTS_MODEL || 'gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
 const TTS_VOICE = 'Kore';
 
+const withTimeout = (p, ms, label) => Promise.race([
+    p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: przekroczono limit ${ms / 1000}s`)), ms))
+]);
+
 function parseJson(t) {
     const c = String(t || '').replace(/```json|```/gi, '').trim();
     try { return JSON.parse(c); } catch (e) {}
@@ -38,14 +42,14 @@ async function makeAudio(text) {
     for (const model of TTS_MODELS) {
         try {
             // Gemini 3.8 TTS czyta tekst dosłownie — nie dopisujemy żadnych poleceń w treści
-            const r = await ai.models.generateContent({
+            const r = await withTimeout(ai.models.generateContent({
                 model,
                 contents: [{ parts: [{ text }] }],
                 config: {
                     responseModalities: ['AUDIO'],
                     speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: TTS_VOICE } } }
                 }
-            });
+            }), 40000, `TTS ${model}`);
             const b64 = r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
             if (!b64) continue;
             const buf = Buffer.from(b64, 'base64');
@@ -62,6 +66,21 @@ async function makeAudio(text) {
 }
 
 app.get('/', (req, res) => res.send('OK'));
+app.get('/health', (req, res) => res.json({ ok: true, textModel: TEXT_MODEL, ttsModels: TTS_MODELS }));
+
+// Osobny endpoint głosu — widżet woła go po otrzymaniu tekstu
+app.post('/api/tts', async (req, res) => {
+    try {
+        const text = String(req.body?.text || '').slice(0, 4000);
+        if (!text) return res.status(400).json({ success: false, error: 'Brak tekstu' });
+        const audio = await makeAudio(text);
+        if (!audio) throw new Error('Model nie zwrócił audio');
+        res.json({ success: true, audio });
+    } catch (error) {
+        console.error('Błąd TTS:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
 
 app.post('/api/analyze', async (req, res) => {
     try {
@@ -96,30 +115,22 @@ Zwróć WYŁĄCZNIE obiekt JSON (bez markdownu, bez komentarzy) z polami:
 `;
 
         // UWAGA: googleSearch nie działa razem z responseMimeType: 'application/json' — JSON parsujemy ręcznie
-        const response = await ai.models.generateContent({
+        const response = await withTimeout(ai.models.generateContent({
             model: TEXT_MODEL,
             contents: prompt,
             config: noData ? {} : { tools: [{ googleSearch: {} }] }
-        });
+        }), 75000, 'Analiza');
 
         const raw = response.text; // w @google/genai to getter, nie funkcja
         const parsed = parseJson(raw) || { textResponse: raw, audioPrompt: raw };
         const textResponse = parsed.textResponse || raw;
         const audioPrompt = parsed.audioPrompt || textResponse;
 
-        let audio = null;
-        try {
-            audio = await makeAudio(audioPrompt);
-        } catch (e) {
-            console.error('TTS nie zadziałał, widget użyje głosu przeglądarki:', e.message);
-        }
-
         const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
         res.json({
             success: true,
             analysis: textResponse,
             audioPrompt,
-            audio, // base64 WAV albo null
             sources: chunks.map(c => c.web?.uri).filter(Boolean)
         });
     } catch (error) {
