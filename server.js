@@ -36,6 +36,43 @@ async function gen(prompt, search, ms, model = TEXT_MODEL) {
     throw last;
 }
 
+// Zbiera adresy źródeł z odpowiedzi Interactions API (adnotacje url_citation)
+function collectSources(i) {
+    const out = new Set();
+    for (const st of i?.steps || []) for (const c of st.content || []) for (const a of c.annotations || []) if (a?.url) out.add(a.url);
+    return [...out];
+}
+
+// Jedno podejście do modelu: najpierw Interactions API (zalecane przez Google), potem klasyczne generateContent
+async function genOne(prompt, search, ms, model) {
+    try {
+        const req = { model, input: prompt, generation_config: { thinking_level: 'low' } };
+        if (search) req.tools = [{ type: 'google_search' }];
+        const i = await withTimeout(ai.interactions.create(req), ms, `Analiza (${model})`);
+        if (!i.output_text) throw new Error('pusta odpowiedź');
+        return { text: i.output_text, model, via: 'interactions', sources: collectSources(i) };
+    } catch (e) {
+        if (/przekroczono limit/.test(e.message)) throw e;
+        console.error(`Interactions (${model}) nie wyszło:`, e.message);
+    }
+    const r = await gen(prompt, search, ms, model);
+    const chunks = r.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
+    return { text: r.text, model, via: 'generateContent', sources: chunks.map(c => c.web?.uri).filter(Boolean) };
+}
+
+// Wszystkie modele naraz — bierzemy pierwszą udaną odpowiedź (gdy jeden jest przeciążony, drugi ratuje sytuację)
+async function genRace(prompt, search, ms) {
+    const t0 = Date.now();
+    try {
+        const r = await Promise.any(TEXT_MODELS.map(m => genOne(prompt, search, ms, m)));
+        console.log(`Analiza OK (${r.model}, ${r.via}${search ? ', z wyszukiwaniem' : ''}): ${Date.now() - t0} ms`);
+        return r;
+    } catch (e) {
+        const msgs = (e.errors || [e]).map(x => x.message).join(' | ');
+        throw new Error(msgs);
+    }
+}
+
 function parseJson(t) {
     const c = String(t || '').replace(/```json|```/gi, '').trim();
     try { return JSON.parse(c); } catch (e) {}
@@ -112,9 +149,14 @@ app.get('/diag', async (req, res) => {
         catch (e) { return { label, ok: false, ms: Date.now() - t0, error: e.message }; }
     };
     const out = await Promise.all([
-        ...TEXT_MODELS.map(m => timed('tekst ' + m, () => withTimeout(ai.models.generateContent({
-            model: m, contents: 'Odpowiedz jednym słowem: ok', config: { thinkingConfig: { thinkingLevel: 'low' } }
-        }), 45000, 'tekst'))),
+        ...TEXT_MODELS.flatMap(m => [
+            timed('tekst (interactions) ' + m, () => withTimeout(ai.interactions.create({
+                model: m, input: 'Odpowiedz jednym słowem: ok', generation_config: { thinking_level: 'low' }
+            }), 45000, 'tekst')),
+            timed('tekst (generateContent) ' + m, () => withTimeout(ai.models.generateContent({
+                model: m, contents: 'Odpowiedz jednym słowem: ok', config: { thinkingConfig: { thinkingLevel: 'low' } }
+            }), 45000, 'tekst'))
+        ]),
         ...TTS_MODELS.map(m => timed('głos ' + m, () => makeAudio('Cześć, tu Gemini. Test głosu.', [m])))
     ]);
     res.json(out);
@@ -180,45 +222,31 @@ Zwróć WYŁĄCZNIE obiekt JSON (bez markdownu, bez komentarzy) z polami:
 - "audioPrompt": wersja pod syntezator mowy: czysty tekst bez markdownu, wypunktowań, symboli i emoji, krótkie zdania, liczby zapisane tak, by dobrze brzmiały na głos, maksymalnie około 200 słów.
 `;
 
-        // UWAGA: googleSearch nie działa razem z responseMimeType: 'application/json' — JSON parsujemy ręcznie
-        // Najpierw z wyszukiwaniem Google (do 45 s); jeśli trwa zbyt długo lub zawiedzie — szybka wersja bez wyszukiwania
-        let response = null, searchUsed = false, lastErr = null;
-        // 1) główny model z wyszukiwaniem Google (35 s)
-        if (!noData) {
-            const t0 = Date.now();
-            try {
-                response = await gen(prompt, true, 35000, TEXT_MODELS[0]);
-                searchUsed = true;
-                console.log(`Analiza z wyszukiwaniem (${TEXT_MODELS[0]}): ${Date.now() - t0} ms`);
-            } catch (e) { lastErr = e; console.error('Analiza z wyszukiwaniem nie wyszła:', e.message); }
+        // Brak danych → nie potrzeba modelu tekstowego: gotowa wypowiedź idzie prosto do głosu (test działa nawet gdy tekstowy Gemini jest przeciążony)
+        if (noData) {
+            const txt = `Cześć! Tu Twój analityk kanału ${channelName}. Na razie nie mam zapisanych żadnych zakończonych sesji, więc nie ma jeszcze czego analizować. Po pierwszej zakończonej transmisji omówię wyniki, a potem szerszy obraz polskiego Twitcha. Ten głos pochodzi z Gemini, więc wszystko działa poprawnie.`;
+            return res.json({ success: true, analysis: txt, audioPrompt: txt, searchUsed: false, sources: [] });
         }
-        // 2) bez wyszukiwania: kolejno główny model i zapasowy (po 30 s)
-        if (!response) {
-            const fallbackPrompt = noData ? prompt : prompt + '\n\nUWAGA: wyszukiwarka jest teraz niedostępna. Opieraj się wyłącznie na przesłanych danych sesji, a w części o rynku wprost powiedz, że bieżących danych o polskim Twitchu nie sprawdzałeś.';
-            for (const m of TEXT_MODELS) {
-                const t1 = Date.now();
-                try {
-                    response = await gen(fallbackPrompt, false, 30000, m);
-                    console.log(`Analiza bez wyszukiwania (${m}): ${Date.now() - t1} ms`);
-                    break;
-                } catch (e) { lastErr = e; console.error(`Analiza (${m}) nie wyszła:`, e.message); }
-            }
-        }
-        if (!response) throw lastErr || new Error('Analiza nie powiodła się');
 
-        const raw = response.text; // w @google/genai to getter, nie funkcja
+        // UWAGA: wyszukiwanie Google nie działa razem z wymuszonym JSON — JSON parsujemy ręcznie
+        let result = null, searchUsed = false, lastErr = null;
+        try {
+            result = await genRace(prompt, true, 40000);
+            searchUsed = true;
+        } catch (e) { lastErr = e; console.error('Analiza z wyszukiwaniem nie wyszła:', e.message); }
+        if (!result) {
+            const fallbackPrompt = prompt + '\n\nUWAGA: wyszukiwarka jest teraz niedostępna. Opieraj się wyłącznie na przesłanych danych sesji, a w części o rynku wprost powiedz, że bieżących danych o polskim Twitchu nie sprawdzałeś.';
+            try { result = await genRace(fallbackPrompt, false, 35000); }
+            catch (e) { lastErr = e; console.error('Analiza bez wyszukiwania nie wyszła:', e.message); }
+        }
+        if (!result) throw lastErr || new Error('Analiza nie powiodła się');
+
+        const raw = result.text;
         const parsed = parseJson(raw) || { textResponse: raw, audioPrompt: raw };
         const textResponse = parsed.textResponse || raw;
         const audioPrompt = parsed.audioPrompt || textResponse;
 
-        const chunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-        res.json({
-            success: true,
-            analysis: textResponse,
-            audioPrompt,
-            searchUsed,
-            sources: chunks.map(c => c.web?.uri).filter(Boolean)
-        });
+        res.json({ success: true, analysis: textResponse, audioPrompt, searchUsed, sources: result.sources || [] });
     } catch (error) {
         console.error('Błąd podczas analizy:', error);
         res.status(500).json({ success: false, error: error.message });
