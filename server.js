@@ -12,20 +12,21 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 // Modele można zmienić w Render → Environment bez ruszania kodu (TEXT_MODEL / TTS_MODEL)
 const TEXT_MODEL = process.env.TEXT_MODEL || 'gemini-3.8-flash';
 const TTS_MODELS = [process.env.TTS_MODEL || 'gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
-const TTS_VOICE = 'Kore';
+const TTS_VOICE = process.env.TTS_VOICE || 'Kore';
+const TEXT_MODELS = [...new Set([TEXT_MODEL, process.env.TEXT_MODEL_FALLBACK || 'gemini-3.7-flash'])];
 
 const withTimeout = (p, ms, label) => Promise.race([
     p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: przekroczono limit ${ms / 1000}s`)), ms))
 ]);
 
 // Wywołanie modelu tekstowego: najpierw z niskim poziomem „myślenia” (szybciej), a gdyby model odrzucił ten parametr — bez niego
-async function gen(prompt, search, ms) {
+async function gen(prompt, search, ms, model = TEXT_MODEL) {
     const base = search ? { tools: [{ googleSearch: {} }] } : {};
     const tries = [{ ...base, thinkingConfig: { thinkingLevel: 'low' } }, base];
     let last = null;
     for (const config of tries) {
         try {
-            return await withTimeout(ai.models.generateContent({ model: TEXT_MODEL, contents: prompt, config }), ms, 'Analiza');
+            return await withTimeout(ai.models.generateContent({ model, contents: prompt, config }), ms, `Analiza (${model})`);
         } catch (e) {
             last = e;
             if (/przekroczono limit/.test(e.message)) throw e; // timeout → nie ponawiamy tu, robi to wywołujący
@@ -54,33 +55,42 @@ function pcmToWav(pcm, sampleRate = 24000, channels = 1, bits = 16) {
     return Buffer.concat([h, pcm]);
 }
 
-async function makeAudio(text) {
+// Wyciąga audio (base64) z odpowiedzi Interactions API
+function pickAudio(i) {
+    if (i?.output_audio?.data) return i.output_audio.data;
+    const steps = i?.steps || i?.outputs || [];
+    for (const st of [...steps].reverse()) {
+        for (const c of [...(st.content || [])].reverse()) if (c?.type === 'audio' && c.data) return c.data;
+    }
+    return null;
+}
+
+// Gemini 3.8 TTS działa przez Interactions API (generateContent z speechConfig jest przez Google odrzucane):
+// tekst w input, głos w generation_config.speech_config, format w response_format
+async function makeAudio(text, models = TTS_MODELS) {
     let lastErr = null;
-    // Schemat Gemini 3.8 TTS: parts[].text = dosłowny transkrypt, styl w speech_metadata, głos w voiceConfig.voice.
-    // Na wypadek zmian po stronie Google próbujemy kilku wariantów (z/bez stylu, nowy/stary zapis głosu).
-    const variants = [
-        { part: { text, speech_metadata: { style: 'spokojny, naturalny, przyjazny ton polskiego analityka, w tempie rozmowy' } }, voiceConfig: { voice: TTS_VOICE } },
-        { part: { text }, voiceConfig: { voice: TTS_VOICE } },
-        { part: { text }, voiceConfig: { prebuiltVoiceConfig: { voiceName: TTS_VOICE } } }
-    ];
-    for (const model of TTS_MODELS) {
-        for (const v of variants) {
+    const styles = [null, 'calm, natural, friendly, conversational pace']; // najpierw bez stylu (zalecane przez Google)
+    for (const model of models) {
+        for (const style of styles) {
             try {
-                const r = await withTimeout(ai.models.generateContent({
+                const part = { type: 'text', text };
+                if (style) part.annotations = [{ type: 'speech_metadata', style }];
+                const interaction = await withTimeout(ai.interactions.create({
                     model,
-                    contents: [{ role: 'user', parts: [v.part] }],
-                    config: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: v.voiceConfig } }
+                    input: [{ type: 'user_input', content: [part] }],
+                    response_format: { type: 'audio' },
+                    generation_config: { speech_config: [{ voice: TTS_VOICE }] }
                 }), 30000, `TTS ${model}`);
-                const b64 = r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+                const b64 = pickAudio(interaction);
                 if (!b64) { lastErr = new Error(`TTS ${model}: brak audio w odpowiedzi`); continue; }
                 const buf = Buffer.from(b64, 'base64');
-                // Nowe modele zwracają gotowy WAV (nagłówek RIFF), starsze surowe PCM
+                // unary zwraca gotowy WAV (RIFF); gdyby przyszedł surowy PCM — dopinamy nagłówek
                 const out = buf.slice(0, 4).toString('ascii') === 'RIFF' ? buf : pcmToWav(buf);
-                console.log(`TTS OK: ${model}, wariant ${variants.indexOf(v) + 1}`);
+                console.log(`TTS OK: ${model}${style ? ' (ze stylem)' : ''}`);
                 return out.toString('base64');
             } catch (e) {
                 lastErr = e;
-                console.error(`TTS (${model}, wariant ${variants.indexOf(v) + 1}) nie zadziałał:`, e.message);
+                console.error(`TTS (${model}${style ? ', ze stylem' : ''}) nie zadziałał:`, e.message);
                 if (/przekroczono limit/.test(e.message)) break; // timeout → następny model
             }
         }
@@ -91,6 +101,38 @@ async function makeAudio(text) {
 
 app.get('/', (req, res) => res.send('OK'));
 app.get('/health', (req, res) => res.json({ ok: true, textModel: TEXT_MODEL, ttsModels: TTS_MODELS }));
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+// Diagnostyka: mierzy czas każdego modelu (tekst + głos) — otwórz w przeglądarce /diag
+app.get('/diag', async (req, res) => {
+    const timed = async (label, fn) => {
+        const t0 = Date.now();
+        try { await fn(); return { label, ok: true, ms: Date.now() - t0 }; }
+        catch (e) { return { label, ok: false, ms: Date.now() - t0, error: e.message }; }
+    };
+    const out = await Promise.all([
+        ...TEXT_MODELS.map(m => timed('tekst ' + m, () => withTimeout(ai.models.generateContent({
+            model: m, contents: 'Odpowiedz jednym słowem: ok', config: { thinkingConfig: { thinkingLevel: 'low' } }
+        }), 45000, 'tekst'))),
+        ...TTS_MODELS.map(m => timed('głos ' + m, () => makeAudio('Cześć, tu Gemini. Test głosu.', [m])))
+    ]);
+    res.json(out);
+});
+
+// Strona testowa głosu: /tts-test  (opcjonalnie ?model=gemini-3.8-flash-lite-tts&text=...)
+app.get('/tts-test', async (req, res) => {
+    const text = String(req.query.text || 'Cześć! Tu Gemini. Sprawdzamy, czy mój głos działa poprawnie i brzmi naturalnie po polsku.').slice(0, 600);
+    const models = req.query.model ? [String(req.query.model)] : TTS_MODELS;
+    const t0 = Date.now();
+    try {
+        const audio = await makeAudio(text, models);
+        if (!audio) throw new Error('Brak audio w odpowiedzi');
+        res.send(`<meta charset="utf-8"><body style="font:16px sans-serif;background:#111;color:#eee;padding:20px"><p>Model: ${esc(models.join(' → '))} · czas: ${Date.now() - t0} ms · głos: ${esc(TTS_VOICE)}</p><audio controls autoplay src="data:audio/wav;base64,${audio}"></audio><p>${esc(text)}</p></body>`);
+    } catch (e) {
+        res.status(500).send(`<meta charset="utf-8"><body style="font:16px sans-serif;background:#111;color:#eee;padding:20px"><p>BŁĄD po ${Date.now() - t0} ms</p><pre style="white-space:pre-wrap;color:#ff8">${esc(e.message)}</pre></body>`);
+    }
+});
 
 // Osobny endpoint głosu — widżet woła go po otrzymaniu tekstu
 app.post('/api/tts', async (req, res) => {
@@ -140,23 +182,29 @@ Zwróć WYŁĄCZNIE obiekt JSON (bez markdownu, bez komentarzy) z polami:
 
         // UWAGA: googleSearch nie działa razem z responseMimeType: 'application/json' — JSON parsujemy ręcznie
         // Najpierw z wyszukiwaniem Google (do 45 s); jeśli trwa zbyt długo lub zawiedzie — szybka wersja bez wyszukiwania
-        let response = null, searchUsed = false;
+        let response = null, searchUsed = false, lastErr = null;
+        // 1) główny model z wyszukiwaniem Google (35 s)
         if (!noData) {
             const t0 = Date.now();
             try {
-                response = await gen(prompt, true, 45000);
+                response = await gen(prompt, true, 35000, TEXT_MODELS[0]);
                 searchUsed = true;
-                console.log(`Analiza z wyszukiwaniem: ${Date.now() - t0} ms`);
-            } catch (e) {
-                console.error('Analiza z wyszukiwaniem nie wyszła, próbuję bez niego:', e.message);
+                console.log(`Analiza z wyszukiwaniem (${TEXT_MODELS[0]}): ${Date.now() - t0} ms`);
+            } catch (e) { lastErr = e; console.error('Analiza z wyszukiwaniem nie wyszła:', e.message); }
+        }
+        // 2) bez wyszukiwania: kolejno główny model i zapasowy (po 30 s)
+        if (!response) {
+            const fallbackPrompt = noData ? prompt : prompt + '\n\nUWAGA: wyszukiwarka jest teraz niedostępna. Opieraj się wyłącznie na przesłanych danych sesji, a w części o rynku wprost powiedz, że bieżących danych o polskim Twitchu nie sprawdzałeś.';
+            for (const m of TEXT_MODELS) {
+                const t1 = Date.now();
+                try {
+                    response = await gen(fallbackPrompt, false, 30000, m);
+                    console.log(`Analiza bez wyszukiwania (${m}): ${Date.now() - t1} ms`);
+                    break;
+                } catch (e) { lastErr = e; console.error(`Analiza (${m}) nie wyszła:`, e.message); }
             }
         }
-        if (!response) {
-            const t1 = Date.now();
-            const fallbackPrompt = noData ? prompt : prompt + '\n\nUWAGA: wyszukiwarka jest teraz niedostępna. Opieraj się wyłącznie na przesłanych danych sesji, a w części o rynku wprost powiedz, że bieżących danych o polskim Twitchu nie sprawdzałeś.';
-            response = await gen(fallbackPrompt, false, 40000);
-            console.log(`Analiza bez wyszukiwania: ${Date.now() - t1} ms`);
-        }
+        if (!response) throw lastErr || new Error('Analiza nie powiodła się');
 
         const raw = response.text; // w @google/genai to getter, nie funkcja
         const parsed = parseJson(raw) || { textResponse: raw, audioPrompt: raw };
