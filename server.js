@@ -18,6 +18,23 @@ const withTimeout = (p, ms, label) => Promise.race([
     p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: przekroczono limit ${ms / 1000}s`)), ms))
 ]);
 
+// Wywołanie modelu tekstowego: najpierw z niskim poziomem „myślenia” (szybciej), a gdyby model odrzucił ten parametr — bez niego
+async function gen(prompt, search, ms) {
+    const base = search ? { tools: [{ googleSearch: {} }] } : {};
+    const tries = [{ ...base, thinkingConfig: { thinkingLevel: 'low' } }, base];
+    let last = null;
+    for (const config of tries) {
+        try {
+            return await withTimeout(ai.models.generateContent({ model: TEXT_MODEL, contents: prompt, config }), ms, 'Analiza');
+        } catch (e) {
+            last = e;
+            if (/przekroczono limit/.test(e.message)) throw e; // timeout → nie ponawiamy tu, robi to wywołujący
+            console.error('Próba generowania nieudana:', e.message);
+        }
+    }
+    throw last;
+}
+
 function parseJson(t) {
     const c = String(t || '').replace(/```json|```/gi, '').trim();
     try { return JSON.parse(c); } catch (e) {}
@@ -110,16 +127,29 @@ Przeanalizuj te dane i przygotuj wypowiedź w języku polskim:
 4. Zwięzła, partnerska forma (jak inteligentny kolega), nastawiona na wartość poznawczą i strategiczną.
 
 Zwróć WYŁĄCZNIE obiekt JSON (bez markdownu, bez komentarzy) z polami:
-- "textResponse": pełny tekst analizy,
-- "audioPrompt": wersja pod syntezator mowy: czysty tekst bez markdownu, wypunktowań, symboli i emoji, krótkie zdania, liczby zapisane tak, by dobrze brzmiały na głos, maksymalnie około 250 słów.
+- "textResponse": pełny tekst analizy (maksymalnie około 300 słów),
+- "audioPrompt": wersja pod syntezator mowy: czysty tekst bez markdownu, wypunktowań, symboli i emoji, krótkie zdania, liczby zapisane tak, by dobrze brzmiały na głos, maksymalnie około 200 słów.
 `;
 
         // UWAGA: googleSearch nie działa razem z responseMimeType: 'application/json' — JSON parsujemy ręcznie
-        const response = await withTimeout(ai.models.generateContent({
-            model: TEXT_MODEL,
-            contents: prompt,
-            config: noData ? {} : { tools: [{ googleSearch: {} }] }
-        }), 75000, 'Analiza');
+        // Najpierw z wyszukiwaniem Google (do 45 s); jeśli trwa zbyt długo lub zawiedzie — szybka wersja bez wyszukiwania
+        let response = null, searchUsed = false;
+        if (!noData) {
+            const t0 = Date.now();
+            try {
+                response = await gen(prompt, true, 45000);
+                searchUsed = true;
+                console.log(`Analiza z wyszukiwaniem: ${Date.now() - t0} ms`);
+            } catch (e) {
+                console.error('Analiza z wyszukiwaniem nie wyszła, próbuję bez niego:', e.message);
+            }
+        }
+        if (!response) {
+            const t1 = Date.now();
+            const fallbackPrompt = noData ? prompt : prompt + '\n\nUWAGA: wyszukiwarka jest teraz niedostępna. Opieraj się wyłącznie na przesłanych danych sesji, a w części o rynku wprost powiedz, że bieżących danych o polskim Twitchu nie sprawdzałeś.';
+            response = await gen(fallbackPrompt, false, 40000);
+            console.log(`Analiza bez wyszukiwania: ${Date.now() - t1} ms`);
+        }
 
         const raw = response.text; // w @google/genai to getter, nie funkcja
         const parsed = parseJson(raw) || { textResponse: raw, audioPrompt: raw };
@@ -131,6 +161,7 @@ Zwróć WYŁĄCZNIE obiekt JSON (bez markdownu, bez komentarzy) z polami:
             success: true,
             analysis: textResponse,
             audioPrompt,
+            searchUsed,
             sources: chunks.map(c => c.web?.uri).filter(Boolean)
         });
     } catch (error) {
