@@ -70,7 +70,7 @@ async function makeAudio(text) {
                     model,
                     contents: [{ role: 'user', parts: [v.part] }],
                     config: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: v.voiceConfig } }
-                }), 40000, `TTS ${model}`);
+                }), 30000, `TTS ${model}`);
                 const b64 = r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
                 if (!b64) { lastErr = new Error(`TTS ${model}: brak audio w odpowiedzi`); continue; }
                 const buf = Buffer.from(b64, 'base64');
@@ -95,7 +95,7 @@ app.get('/health', (req, res) => res.json({ ok: true, textModel: TEXT_MODEL, tts
 // Osobny endpoint głosu — widżet woła go po otrzymaniu tekstu
 app.post('/api/tts', async (req, res) => {
     try {
-        const text = String(req.body?.text || '').slice(0, 4000);
+        const text = String(req.body?.text || '').slice(0, 1500);
         if (!text) return res.status(400).json({ success: false, error: 'Brak tekstu' });
         const audio = await makeAudio(text);
         if (!audio) throw new Error('Model nie zwrócił audio');
