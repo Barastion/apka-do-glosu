@@ -56,26 +56,33 @@ function pcmToWav(pcm, sampleRate = 24000, channels = 1, bits = 16) {
 
 async function makeAudio(text) {
     let lastErr = null;
+    // Schemat Gemini 3.8 TTS: parts[].text = dosłowny transkrypt, styl w speech_metadata, głos w voiceConfig.voice.
+    // Na wypadek zmian po stronie Google próbujemy kilku wariantów (z/bez stylu, nowy/stary zapis głosu).
+    const variants = [
+        { part: { text, speech_metadata: { style: 'spokojny, naturalny, przyjazny ton polskiego analityka, w tempie rozmowy' } }, voiceConfig: { voice: TTS_VOICE } },
+        { part: { text }, voiceConfig: { voice: TTS_VOICE } },
+        { part: { text }, voiceConfig: { prebuiltVoiceConfig: { voiceName: TTS_VOICE } } }
+    ];
     for (const model of TTS_MODELS) {
-        try {
-            // Gemini 3.8 TTS czyta tekst dosłownie — nie dopisujemy żadnych poleceń w treści
-            const r = await withTimeout(ai.models.generateContent({
-                model,
-                contents: [{ parts: [{ text }] }],
-                config: {
-                    responseModalities: ['AUDIO'],
-                    speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: TTS_VOICE } } }
-                }
-            }), 40000, `TTS ${model}`);
-            const b64 = r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
-            if (!b64) continue;
-            const buf = Buffer.from(b64, 'base64');
-            // Nowe modele zwracają gotowy WAV (nagłówek RIFF), starsze surowe PCM
-            const out = buf.slice(0, 4).toString('ascii') === 'RIFF' ? buf : pcmToWav(buf);
-            return out.toString('base64');
-        } catch (e) {
-            lastErr = e;
-            console.error(`TTS (${model}) nie zadziałał:`, e.message);
+        for (const v of variants) {
+            try {
+                const r = await withTimeout(ai.models.generateContent({
+                    model,
+                    contents: [{ role: 'user', parts: [v.part] }],
+                    config: { responseModalities: ['AUDIO'], speechConfig: { voiceConfig: v.voiceConfig } }
+                }), 40000, `TTS ${model}`);
+                const b64 = r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+                if (!b64) { lastErr = new Error(`TTS ${model}: brak audio w odpowiedzi`); continue; }
+                const buf = Buffer.from(b64, 'base64');
+                // Nowe modele zwracają gotowy WAV (nagłówek RIFF), starsze surowe PCM
+                const out = buf.slice(0, 4).toString('ascii') === 'RIFF' ? buf : pcmToWav(buf);
+                console.log(`TTS OK: ${model}, wariant ${variants.indexOf(v) + 1}`);
+                return out.toString('base64');
+            } catch (e) {
+                lastErr = e;
+                console.error(`TTS (${model}, wariant ${variants.indexOf(v) + 1}) nie zadziałał:`, e.message);
+                if (/przekroczono limit/.test(e.message)) break; // timeout → następny model
+            }
         }
     }
     if (lastErr) throw lastErr;
