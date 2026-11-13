@@ -9,8 +9,9 @@ app.use(cors());
 // Klucz pobierany ze zmiennej środowiskowej GEMINI_API_KEY (Render → Environment)
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const TEXT_MODEL = 'gemini-2.5-flash';
-const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+// Modele można zmienić w Render → Environment bez ruszania kodu (TEXT_MODEL / TTS_MODEL)
+const TEXT_MODEL = process.env.TEXT_MODEL || 'gemini-3.8-flash';
+const TTS_MODELS = [process.env.TTS_MODEL || 'gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
 const TTS_VOICE = 'Kore';
 
 function parseJson(t) {
@@ -33,26 +34,46 @@ function pcmToWav(pcm, sampleRate = 24000, channels = 1, bits = 16) {
 }
 
 async function makeAudio(text) {
-    const r = await ai.models.generateContent({
-        model: TTS_MODEL,
-        contents: [{ parts: [{ text: 'Przeczytaj po polsku, spokojnym i naturalnym tonem, jak kolega analityk: ' + text }] }],
-        config: {
-            responseModalities: ['AUDIO'],
-            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: TTS_VOICE } } }
+    let lastErr = null;
+    for (const model of TTS_MODELS) {
+        try {
+            // Gemini 3.8 TTS czyta tekst dosłownie — nie dopisujemy żadnych poleceń w treści
+            const r = await ai.models.generateContent({
+                model,
+                contents: [{ parts: [{ text }] }],
+                config: {
+                    responseModalities: ['AUDIO'],
+                    speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: TTS_VOICE } } }
+                }
+            });
+            const b64 = r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
+            if (!b64) continue;
+            const buf = Buffer.from(b64, 'base64');
+            // Nowe modele zwracają gotowy WAV (nagłówek RIFF), starsze surowe PCM
+            const out = buf.slice(0, 4).toString('ascii') === 'RIFF' ? buf : pcmToWav(buf);
+            return out.toString('base64');
+        } catch (e) {
+            lastErr = e;
+            console.error(`TTS (${model}) nie zadziałał:`, e.message);
         }
-    });
-    const b64 = r.candidates?.[0]?.content?.parts?.find(p => p.inlineData)?.inlineData?.data;
-    if (!b64) return null;
-    return pcmToWav(Buffer.from(b64, 'base64')).toString('base64');
+    }
+    if (lastErr) throw lastErr;
+    return null;
 }
 
 app.get('/', (req, res) => res.send('OK'));
 
 app.post('/api/analyze', async (req, res) => {
     try {
-        const { sessionsHistory = [], currentSession = null, channelName = 'Dolaricious' } = req.body;
+        const { sessionsHistory = [], currentSession = null, channelName = 'Dolaricious', noData = false } = req.body;
 
-        const prompt = `
+        const emptyPrompt = `
+Jesteś asystentem-analitykiem kanału Twitch streamera ${channelName}. Widżet nie ma jeszcze zapisanej żadnej zakończonej sesji, więc nie ma czego analizować.
+Napisz po polsku krótką, życzliwą wypowiedź (ok. 70 słów): przywitaj się, powiedz wprost, że na razie brak danych z sesji, i że po pierwszej zakończonej transmisji omówisz wyniki oraz szerszy obraz polskiego Twitcha. Potwierdź, że głos działa poprawnie. Nie podawaj żadnych statystyk ani liczb.
+Zwróć WYŁĄCZNIE JSON: {"textResponse": "...", "audioPrompt": "..."} — audioPrompt to ten sam tekst, czysty, bez markdownu i emoji.
+`;
+
+        const prompt = noData ? emptyPrompt : `
 Jesteś profesjonalnym analitykiem kanału Twitch oraz polskiego rynku streamingowego dla streamera o nicku ${channelName}.
 
 Dane historycznych sesji z widgetu (najnowsze pierwsze):
@@ -78,7 +99,7 @@ Zwróć WYŁĄCZNIE obiekt JSON (bez markdownu, bez komentarzy) z polami:
         const response = await ai.models.generateContent({
             model: TEXT_MODEL,
             contents: prompt,
-            config: { tools: [{ googleSearch: {} }] }
+            config: noData ? {} : { tools: [{ googleSearch: {} }] }
         });
 
         const raw = response.text; // w @google/genai to getter, nie funkcja
