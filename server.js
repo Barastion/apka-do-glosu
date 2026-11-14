@@ -247,12 +247,12 @@ const keepBigSpikes = s => (s && Array.isArray(s.skokiWidzow))
 // ═══════════════ DATA I CZAS ═══════════════
 const TZ = 'Europe/Warsaw';
 function warsawParts(d) {
-    const f = new Intl.DateTimeFormat('pl-PL', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long', hour: '2-digit', minute: '2-digit', hour12: false });
+    const f = new Intl.DateTimeFormat('pl-PL', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
     return Object.fromEntries(f.formatToParts(d).map(x => [x.type, x.value]));
 }
 const warsawYmd = d => { const p = warsawParts(d); return `${p.year}-${p.month}-${p.day}`; };
 const dayDiff = (a, b) => Math.round((Date.parse(warsawYmd(a) + 'T00:00:00Z') - Date.parse(warsawYmd(b) + 'T00:00:00Z')) / 864e5);
-const clock = d => new Intl.DateTimeFormat('pl-PL', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
+const clock = d => new Intl.DateTimeFormat('pl-PL', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(d);
 
 // Polska odmiana: 1 → one, 2–4 (poza 12–14) → few, reszta → many
 const plural = (n, one, few, many) => {
@@ -287,6 +287,58 @@ function durFraza(totalMin) {
     return [hTxt, mTxt].filter(Boolean).join(' i ');
 }
 const sessMin = s => s && (s.czasTrwaniaMin > 0 ? s.czasTrwaniaMin : (s.start && s.koniec ? Math.max(0, (Date.parse(s.koniec) - Date.parse(s.start)) / 6e4) : 0));
+
+// Godzina 24-godzinna zapisana słownie w formie „od … / do … / o …” (np. 17:30 → „siedemnastej trzydzieści”).
+// Model dostaje gotowe frazy i ma je przepisywać — nie zamienia sam „17:30” na „piąta trzydzieści”.
+const GODZ_DOP = ['północy', 'pierwszej', 'drugiej', 'trzeciej', 'czwartej', 'piątej', 'szóstej', 'siódmej', 'ósmej', 'dziewiątej', 'dziesiątej', 'jedenastej', 'dwunastej', 'trzynastej', 'czternastej', 'piętnastej', 'szesnastej', 'siedemnastej', 'osiemnastej', 'dziewiętnastej', 'dwudziestej', 'dwudziestej pierwszej', 'dwudziestej drugiej', 'dwudziestej trzeciej'];
+const MIN_SLOW = { 15: 'piętnaście', 30: 'trzydzieści', 45: 'czterdzieści pięć' };
+function godzSlownie(hhmm) {
+    const [h, m] = String(hhmm).split(':').map(Number);
+    if (!Number.isFinite(h) || !Number.isFinite(m)) return String(hhmm);
+    if (h % 24 === 0 && m === 30) return 'pół godziny po północy';
+    const base = GODZ_DOP[h % 24];
+    return m ? `${base} ${MIN_SLOW[m] || m}` : base;
+}
+const okresSlownie = (a, b) => `od ${godzSlownie(a)} do ${godzSlownie(b)}`;
+
+// Jedno źródło prawdy o czasie sesji: start i koniec (ISO). Pola z widżetu (czasTrwaniaMin, godzinaStartu, godzinaKonca, dzienTygodnia)
+// bywają niespójne, więc je sprawdzamy i w razie rozbieżności przeliczamy. Wszystkie rozbieżności trafiają do ostrzeżeń (log + odpowiedź).
+// Wyłączenie poprawiania czasu trwania: zmienna środowiskowa CZAS_Z_KONCA=0.
+const DUR_FROM_SPAN = process.env.CZAS_Z_KONCA !== '0';
+const hhmmNorm = v => String(v || '').trim().replace(/^(\d):/, '0$1:').slice(0, 5);
+function fixSession(s, warns = []) {
+    if (!s || !s.start) return s;
+    const t0 = Date.parse(s.start);
+    if (!Number.isFinite(t0)) { warns.push(`sesja z niepoprawnym startem: ${s.start}`); return s; }
+    const o = { ...s }, tag = `${warsawYmd(new Date(t0))} ${clock(new Date(t0))}`;
+    const dur = Number(s.czasTrwaniaMin) || 0;
+    const e = s.koniec ? Date.parse(s.koniec) : (s.trwaJeszcze ? Date.now() : NaN);
+    let t1 = null;
+    if (Number.isFinite(e)) {
+        const span = (e - t0) / 6e4;
+        if (span > 0 && span <= 24 * 60) {
+            t1 = e;
+            if (span > 14 * 60) warns.push(`sesja ${tag}: podejrzanie długa (${Math.round(span / 60)} h) — sprawdź zapis startu/końca w widżecie`);
+            if (!(dur > 0) || Math.abs(span - dur) > Math.max(10, dur * 0.1)) {
+                warns.push(`sesja ${tag}: czasTrwaniaMin=${dur} z widżetu, a start→koniec = ${Math.round(span)} min${DUR_FROM_SPAN ? ' — użyto start→koniec' : ' (poprawka wyłączona)'}`);
+                if (DUR_FROM_SPAN) o.czasTrwaniaMin = Math.round(span);
+            }
+        } else if (s.koniec) warns.push(`sesja ${tag}: koniec (${s.koniec}) nielogiczny względem startu — pominięto`);
+    }
+    const st = clock(new Date(t0));
+    if (s.godzinaStartu && hhmmNorm(s.godzinaStartu) !== st) warns.push(`sesja ${tag}: godzinaStartu z widżetu=${s.godzinaStartu}, z pola start=${st} — użyto ${st}`);
+    o.godzinaStartu = st;
+    const endMs = t1 ?? t0 + (o.czasTrwaniaMin || 0) * 6e4;
+    if (s.koniec || s.godzinaKonca || o.czasTrwaniaMin > 0) {
+        const en = clock(new Date(endMs));
+        if (s.godzinaKonca && hhmmNorm(s.godzinaKonca) !== en) warns.push(`sesja ${tag}: godzinaKonca z widżetu=${s.godzinaKonca}, wyliczona=${en} — użyto ${en}`);
+        if (!s.trwaJeszcze) o.godzinaKonca = en;
+    }
+    const wd = warsawParts(new Date(t0)).weekday;
+    if (s.dzienTygodnia && String(s.dzienTygodnia).toLowerCase() !== wd) warns.push(`sesja ${tag}: dzienTygodnia z widżetu=${s.dzienTygodnia}, z pola start=${wd} — użyto ${wd}`);
+    o.dzienTygodnia = wd;
+    return o;
+}
 
 function calendarContext(now = new Date()) {
     const p = warsawParts(now), dow = new Date(Date.UTC(+p.year, +p.month - 1, +p.day)).getUTCDay();
@@ -440,7 +492,7 @@ function bestMoments(items) {
     const runs = [];
     for (const r of hot) { const l = runs[runs.length - 1]; if (l && r.k === l.rows[l.rows.length - 1].k + 1) l.rows.push(r); else runs.push({ rows: [r] }); }
     const part = (rs, key) => { const v = rs.map(x => x[key]).filter(x => x != null); return v.length ? round(meanOf(v), 2) : undefined; };
-    const mocnePrzedzialy = runs.map(u => { const low = u.rows.reduce((a, x) => (x.hit / x.sesji < a.hit / a.sesji ? x : a)); return ({ okres: `${slotTime(u.rows[0].k)}–${slotTime(u.rows[u.rows.length - 1].k + 1)}`, indeks: round(meanOf(u.rows.map(x => x.indeks)), 2), widzow: round(meanOf(u.rows.map(x => x.widzow)), 1), czatIdx: part(u.rows, 'idxC'), followyIdx: part(u.rows, 'idxF'), powyzejSredniej: `${low.hit}/${low.sesji}`, sesjiMin: Math.min(...u.rows.map(x => x.sesji)), wiarygodnosc: sampleLabel(Math.min(...u.rows.map(x => x.sesji))), _w: meanOf(u.rows.map(x => x.indeks)) }); })
+    const mocnePrzedzialy = runs.map(u => { const low = u.rows.reduce((a, x) => (x.hit / x.sesji < a.hit / a.sesji ? x : a)); return ({ okres: `${slotTime(u.rows[0].k)}–${slotTime(u.rows[u.rows.length - 1].k + 1)}`, okresSlownie: okresSlownie(slotTime(u.rows[0].k), slotTime(u.rows[u.rows.length - 1].k + 1)), indeks: round(meanOf(u.rows.map(x => x.indeks)), 2), widzow: round(meanOf(u.rows.map(x => x.widzow)), 1), czatIdx: part(u.rows, 'idxC'), followyIdx: part(u.rows, 'idxF'), powyzejSredniej: `${low.hit}/${low.sesji}`, sesjiMin: Math.min(...u.rows.map(x => x.sesji)), wiarygodnosc: sampleLabel(Math.min(...u.rows.map(x => x.sesji))), _w: meanOf(u.rows.map(x => x.indeks)) }); })
         .sort((a, b) => b._w - a._w).slice(0, 3).map(({ _w, ...x }) => x);
     const najlepszePory = Object.entries(bands).map(([b, arr]) => ({
         pora: b, sesji: arr.length, sredniaWidzow: round(agg(arr, 'v'), 1), indeks: round(agg(arr, 'idx'), 2), wiarygodnosc: sampleLabel(arr.length)
@@ -449,7 +501,7 @@ function bestMoments(items) {
     return {
         uwaga: 'Wynik dnia 0–100: widownia 50%, followy/h 30%, wiadomości/h 20%. Okna 30-min: indeks złożony (widownia 50%, followy 30%, czat 20%; brak danych = składnik pomijany), 1,0 = średnia streama; czatIdx i followyIdx to składniki (1,0 = średnia streama); powyzejSredniej = w ilu sesjach widownia okna była ponad średnią streama; rozped=true: okno z początku streama (rozpęd, dane cenne); odStartuH: godz. po starcie; sesjiZPrzebiegiem: liczba sesji z oknami.',
         najlepszeDni, najlepszePory,
-        mocneOkna: [...hot].sort((a, b) => b.indeks - a.indeks).slice(0, 2).map(r => ({ okno: `${slotTime(r.k)}–${slotTime(r.k + 1)}`, sesji: r.sesji, widzow: round(r.widzow, 1), indeks: round(r.indeks, 2), czatIdx: round(r.idxC, 2), followyIdx: round(r.idxF, 2), powyzejSredniej: `${r.hit}/${r.sesji}`, odStartuH: round(r.odStartu, 1), rozped: r.rozped || undefined, wiarygodnosc: sampleLabel(r.sesji) })),
+        mocneOkna: [...hot].sort((a, b) => b.indeks - a.indeks).slice(0, 2).map(r => ({ okno: `${slotTime(r.k)}–${slotTime(r.k + 1)}`, oknoSlownie: okresSlownie(slotTime(r.k), slotTime(r.k + 1)), sesji: r.sesji, widzow: round(r.widzow, 1), indeks: round(r.indeks, 2), czatIdx: round(r.idxC, 2), followyIdx: round(r.idxF, 2), powyzejSredniej: `${r.hit}/${r.sesji}`, odStartuH: round(r.odStartu, 1), rozped: r.rozped || undefined, wiarygodnosc: sampleLabel(r.sesji) })),
         mocnePrzedzialy: mocnePrzedzialy.length ? mocnePrzedzialy : undefined,
         sesjiZPrzebiegiem: nS
     };
@@ -502,7 +554,7 @@ function followMoments(fk, sessions) {
         for (const x of [D[d], H[h], bb(h)]) { x.min += m; x.fS += n; }
     }
     const rate = x => x.min > 0 ? x.fS / (x.min / 60) : 0;
-    const per = (x, label, name) => ({ [label]: name, followy: x.fS, godzinStreamu: round(x.min / 60, 1), naGodzine: round(rate(x), 2) });
+    const per = (x, label, name) => ({ [label]: name, ...(label === 'godz' ? { godzinaSlownie: godzSlownie(name) } : {}), followy: x.fS, godzinStreamu: round(x.min / 60, 1), naGodzine: round(rate(x), 2) });
     const bandNames = Object.keys(B);
     const best = (rows, minMin, n) => rows.filter(r => r.x.min >= minMin && r.x.fS > 0).sort((a, b) => rate(b.x) - rate(a.x)).slice(0, n);
     const totalBy = (rows, n) => rows.filter(r => r.x.f > 0).sort((a, b) => b.x.f - a.x.f).slice(0, n);
@@ -723,9 +775,10 @@ TRYB: STREAM ZAKOŃCZONY / OFFLINE.
 8. Dwa streamy lub więcej tego samego dnia (pole "dniZWieluStreamami"): oceń najpierw dzień łącznie (czas, widzowie, followy), potem sesje osobno i porównaj np. poranny z wieczornym wartościami na godzinę — to cenne dane o najlepszych momentach. Różnicę między nimi tłumacz porą i przerwą, nie traktuj jej jako samodzielnego wniosku.
 9. Pora i konkurencja: piątkowy wieczór, sobota, niedziela i święta to nie tylko więcej oglądających, ale też więcej streamujących naraz, bo jedno idzie w parze z drugim. Zakładaj to zawsze, także gdy brakuje danych z sieci. Uwzględniaj to w szukaniu przyczyn jako prawdopodobną hipotezę, obok innych możliwych przyczyn.
 10. Mów o liczbach z sensem, dla słuchacza, który słyszy tekst raz i nie może wrócić do poprzedniego zdania. Najpierw wniosek własnymi słowami, potem liczba, która go potwierdza („widownia była wyraźnie większa niż zwykle, średnio o około dwadzieścia procent”). Każda liczba ma od razu mieć znaczenie: powiedz, co oznacza, a nie tylko ją podaj. Liczby i procenty są mile widziane, ale oszczędnie i tam, gdzie coś pokazują: nie w każdym zdaniu, najwyżej jedna–dwie w zdaniu i nigdy kilka procentów pod rząd. Zaokrąglaj jak w rozmowie („prawie czterdzieści osób”, „co trzeci”); dokładnie podawaj tylko czas trwania i godziny. Nie czytaj nazw pól, indeksów ani współczynników — zamień je na zwykłe słowa. Z danych wybierz to, co najważniejsze, i pomiń resztę.
+11. GODZINY: zawsze w systemie 24-godzinnym, słownie, tak jak w danych (17:30 = „siedemnasta trzydzieści”, nigdy „piąta trzydzieści” ani „piąta po południu”; bez „rano”, „po południu”, „w nocy” przy godzinach). Gdy w danych jest gotowe pole „okresSlownie”, „oknoSlownie” lub „godzinaSlownie”, przepisz je bez zmian. Nie zmieniaj, nie przesuwaj i nie zgaduj godzin; podawaj tylko te, które są w danych.
 
 ═══ CO ANALIZOWAĆ ═══
-A. Najlepsze momenty (pole "najlepszeMomenty", nie licz w pamięci): wskaż maks. 3 najlepsze dni tygodnia, maks. 2 najlepsze pory dnia (rano, południe, popołudnie, wieczór, noc) oraz godziny warte uwagi ("mocneOkna" = najmocniejsze okna półgodzinne, "mocnePrzedzialy" = ciągłe przedziały godzin z widownią wyraźnie powyżej średniej streama, także w środku sesji; podawaj przedziały, np. „od dwudziestej do dwudziestej drugiej trzydzieści”). Nie wymieniaj więcej. Poprzyj to jedną lub dwiema najważniejszymi liczbami z danych, zaokrąglonymi i podanymi po ludzku (nie czytaj indeksów); bez danych niczego nie wskazuj. Tylko wspomnij, że to mocne dni i godziny według danych — bez sugerowania, kiedy warto być online. Dni i godziny to dwa OSOBNE wnioski: podaj je osobno („mocne dni”, „mocne godziny”) i nigdy nie łącz ich w „wtorek o dwudziestej” — dane nie sprawdzają tej kombinacji. Gdy widownia jest mała, a czatIdx, followyIdx, wiadomosciNaWidzaNaGodzine lub followyNa100GodzinOgladania wysokie, powiedz, że to mała, ale zaangażowana widownia. Godziny liczone są z wielu zapisanych sesji ("sesjiZPrzebiegiem") — możesz powiedzieć, z ilu. Dołącz "followyMomenty", jeśli pasuje do tych godzin. "odStartuH" mówi, ile godzin po starcie streama wypadała dana godzina. Przy małej próbie ("wiarygodnosc") mów ostrożnie („na razie wygląda na…”), ale nadal wskaż najlepsze. Szukaj PRZYCZYN (początek weekendu, święto, wakacje/ferie, pora roku, wydarzenia z kontekstu, ruch i konkurencja wg zasady 9).
+A. Najlepsze momenty (pole "najlepszeMomenty", nie licz w pamięci): wskaż maks. 3 najlepsze dni tygodnia, maks. 2 najlepsze pory dnia (rano, południe, popołudnie, wieczór, noc) oraz godziny warte uwagi ("mocneOkna" = najmocniejsze okna półgodzinne, "mocnePrzedzialy" = ciągłe przedziały godzin z widownią wyraźnie powyżej średniej streama, także w środku sesji; podawaj przedziały gotową frazą z „okresSlownie”, np. „od dwudziestej do dwudziestej drugiej trzydzieści”). Nie wymieniaj więcej. Poprzyj to jedną lub dwiema najważniejszymi liczbami z danych, zaokrąglonymi i podanymi po ludzku (nie czytaj indeksów); bez danych niczego nie wskazuj. Tylko wspomnij, że to mocne dni i godziny według danych — bez sugerowania, kiedy warto być online. Dni i godziny to dwa OSOBNE wnioski: podaj je osobno („mocne dni”, „mocne godziny”) i nigdy nie łącz ich w „wtorek o dwudziestej” — dane nie sprawdzają tej kombinacji. Gdy widownia jest mała, a czatIdx, followyIdx, wiadomosciNaWidzaNaGodzine lub followyNa100GodzinOgladania wysokie, powiedz, że to mała, ale zaangażowana widownia. Godziny liczone są z wielu zapisanych sesji ("sesjiZPrzebiegiem") — możesz powiedzieć, z ilu. Dołącz "followyMomenty", jeśli pasuje do tych godzin. "odStartuH" mówi, ile godzin po starcie streama wypadała dana godzina. Przy małej próbie ("wiarygodnosc") mów ostrożnie („na razie wygląda na…”), ale nadal wskaż najlepsze. Szukaj PRZYCZYN (początek weekendu, święto, wakacje/ferie, pora roku, wydarzenia z kontekstu, ruch i konkurencja wg zasady 9).
 A2. Wzorce WEWNĄTRZ streama: w tabeli PRZEBIEG NAJNOWSZEJ SESJI (każda linia ma godzinę) i w słupkach z "aktualnie" znajdź wzrosty i spadki widowni i czatu, podaj godzinę i prawdopodobną przyczynę. Pierwszą godzinę streama („rozped”) traktuj jako rozpęd: niższa widownia na początku jest normalna i nie jest słabością, ale dane z niej są cenne.
 B. Gry: nowsze mają większą wagę (policzona). Wykorzystaj kontekst o oglądalności, stosunku widzów do streamujących, patchach i eventach.
 C. Tytuł i gra a wyniki: przy „DROP”/„drops” w tytule sprawdź, czy wzrost widowni przełożył się na piszących. Widzów więcej, a czat bez zmian = widzowie głównie „po nagrody”; rosną oba = stream faktycznie trzyma.
@@ -884,7 +937,7 @@ app.post('/api/analyze', async (req, res) => {
     try {
         const body = req.body || {};
         const { sessionsHistory = [], currentSession = null, channelName = 'Dolaricious', noData = false, kanal = {}, teraz = {} } = body;
-        const PROMPT_V = 'v2';   // zmieniaj po edycji promptu, żeby stare analizy z pamięci podręcznej nie wracały
+        const PROMPT_V = 'v3';   // zmieniaj po edycji promptu, żeby stare analizy z pamięci podręcznej nie wracały
         const live = body.tryb === 'live' || (body.tryb == null && !!currentSession?.trwaJeszcze);
         const mode = live ? 'live' : 'offline';
 
@@ -902,7 +955,9 @@ app.post('/api/analyze', async (req, res) => {
 
         const result = await cacheMain.memo(key, live ? TTL.analysisLive : TTL.analysisOffline, async () => {
             const tStart = Date.now();
-            const cs = keepBigSpikes(stripNicks(currentSession)), hist = (Array.isArray(sessionsHistory) ? stripNicks(sessionsHistory) : []).map(keepBigSpikes);   // model nie dostaje nicków
+            const warns = [];
+            const cs = keepBigSpikes(fixSession(stripNicks(currentSession), warns)), hist = (Array.isArray(sessionsHistory) ? stripNicks(sessionsHistory) : []).map(x => keepBigSpikes(fixSession(x, warns)));
+            if (warns.length) console.warn('Niespójności w danych sesji: ' + warns.join(' | '));   // model nie dostaje nicków
             const derived = derive(cs, hist, stripNicks(kanal));
             const ctx = await research(body, cal, mode);           // zwykle z pamięci podręcznej
             const searchUsed = !!ctx.net;
@@ -913,10 +968,10 @@ app.post('/api/analyze', async (req, res) => {
             if (!text) throw new Error('Pusta odpowiedź modelu');
             // Gdy nie udało się zbadać sieci, nie utrwalamy tej uboższej analizy na długo
             if (!searchUsed) setTimeout(() => cacheMain.del(key), 60e3).unref?.();
-            return { text, searchUsed, sources: ctx.sources };
+            return { text, searchUsed, sources: ctx.sources, ostrzezenia: warns };
         });
 
-        res.json({ success: true, analysis: result.text, audioPrompt: result.text, searchUsed: result.searchUsed, sources: result.sources || [], mode });
+        res.json({ success: true, analysis: result.text, audioPrompt: result.text, searchUsed: result.searchUsed, sources: result.sources || [], ostrzezeniaDanych: result.ostrzezenia || [], mode });
     } catch (error) {
         console.error('Błąd podczas analizy:', error);
         if (isQuota(error)) return res.status(429).json({ success: false, error: 'Limit Gemini wyczerpany — spróbuj za chwilę (limit minutowy) lub po ok. 9:00 (limit dzienny). Stan: ai.dev/rate-limit' + (blockedSummary() ? ' · wstrzymane: ' + blockedSummary() : '') });
