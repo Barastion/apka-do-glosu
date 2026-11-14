@@ -41,6 +41,7 @@ const TTS_STYLES = {
     offline: 'calm, analytical, professional female voice, clear and measured pace, natural and friendly'
 };
 
+const isQuota = e => /429|RESOURCE_EXHAUSTED|exceeded your current quota/i.test(String(e?.message || e));
 const withTimeout = (p, ms, label) => Promise.race([
     p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: przekroczono limit ${Math.round(ms / 1000)}s`)), ms))
 ]);
@@ -48,6 +49,8 @@ const withTimeout = (p, ms, label) => Promise.race([
 // ═══════════════ PAMIĘĆ PODRĘCZNA (przechowuje też obietnice w toku, więc równoległe kliknięcia nie dublują zapytań) ═══════════════
 function makeCache(max) {
     const m = new Map();
+    // co 10 minut usuwamy przeterminowane wpisy, nawet jeśli nikt już o nie nie pyta
+    setInterval(() => { const now = Date.now(); for (const [k, e] of m) if (e.exp <= now) m.delete(k); }, 10 * 60e3).unref();
     return {
         del: k => m.delete(k),
         async memo(k, ttl, fn) {
@@ -78,7 +81,7 @@ async function gen(prompt, search, ms, model, think) {
             return await withTimeout(ai.models.generateContent({ model, contents: prompt, config }), ms, `Analiza (${model})`);
         } catch (e) {
             last = e;
-            if (/przekroczono limit/.test(e.message)) throw e;
+            if (/przekroczono limit/.test(e.message) || isQuota(e)) throw e;
             console.error('Próba generowania nieudana:', e.message);
         }
     }
@@ -99,7 +102,7 @@ async function genOne(prompt, search, ms, model, think) {
         if (!i.output_text) throw new Error('pusta odpowiedź');
         return { text: i.output_text, model, via: 'interactions', sources: collectSources(i) };
     } catch (e) {
-        if (/przekroczono limit/.test(e.message)) throw e;
+        if (/przekroczono limit/.test(e.message) || isQuota(e)) throw e;
         console.error(`Interactions (${model}) nie wyszło:`, e.message);
     }
     const r = await gen(prompt, search, ms, model, think);
@@ -333,6 +336,7 @@ C. Tytuł i gra a wyniki: przy „DROP”/„drops” w tytule sprawdź, czy wzr
 D. Korelacje: więcej widzów + więcej wiadomości = dobry znak; mało widzów, ale obecnych długo = stabilna publiczność; mało widzów i pisze ta sama grupa (wysoki udział czatujących) = własne grono. Wskaż, która sytuacja wygląda na prawdziwą.
 E. Rajdy: "skokiWidzow" = nagły wzrost z szybkim odpływem. Powiedz, że to prawdopodobnie rajd lub hosting (hipoteza), jak wygląda widownia „bazowa” bez skoku. Bez nicków.
 F. Czas trwania: nie porównuj sesji 1:1 — używaj wartości na godzinę z "porownanieNajnowszejSesji" i wspominaj o różnicy długości.
+G0. Kiedy wpadają followy: pole "followyKiedy" (liczby followów w ostatnich 60 dniach wg godziny czasu polskiego 0–23 i dnia tygodnia pon–niedz, oraz jaki ułamek wpadł podczas streamów). Wskaż godziny i dni, w których followy wpadają najczęściej, i podaj prawdopodobne przyczyny — wyłącznie jako obserwację (zasada 3), bez rad zmiany pory streamowania. Przy małej próbce (poniżej ok. 20 followów) powiedz, że to za mało danych na wnioski; nie przesadzaj ze znaczeniem pojedynczych liczb.
 G. Tempo rozwoju: followersi w 30 dni i wzrost procentowy, saldo po unfollowach, suby (nowe i wygasłe), data ostatniego followa i suba. Nazwij dobry okres, jeśli rosną. Zaznacz, że część danych subów jest przybliżona.
 H. Zawsze szukaj PRZYCZYN odchyleń, nie samego „o 5% więcej niż zwykle”.
 ${modeBlock}
@@ -515,6 +519,7 @@ app.post('/api/analyze', async (req, res) => {
         res.json({ success: true, analysis: result.text, audioPrompt: result.text, searchUsed: result.searchUsed, sources: result.sources || [], mode });
     } catch (error) {
         console.error('Błąd podczas analizy:', error);
+        if (isQuota(error)) return res.status(429).json({ success: false, error: 'Limit Gemini wyczerpany — spróbuj za chwilę (limit minutowy) lub po ok. 9:00 (limit dzienny). Stan: ai.dev/rate-limit' });
         res.status(500).json({ success: false, error: error.message });
     }
 });
