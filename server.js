@@ -30,9 +30,13 @@ const noThink = m => /gemma|2\.5/i.test(m);
 const THINK = { live: process.env.THINK_LIVE || 'low', offline: process.env.THINK_OFFLINE || 'low' };
 
 // Czas: KAŻDY model ma własne 45 s (PER_MODEL_MS). Gdy model zwróci błąd (np. 429), przechodzimy do następnego od razu, bez czekania.
-// Najwyżej MAX_ATTEMPTS prób na etap (badanie sieci / analiza). Render dopuszcza do 100 min na jedno zapytanie, więc to bezpieczne.
+// Natychmiastowe odrzucenia (429 / 404) NIE zużywają limitu prób — liczą się tylko timeouty i błędy serwera (MAX_ATTEMPTS).
 const PER_MODEL_MS = Number(process.env.PER_MODEL_MS) || 45000;
 const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS) || 3;
+// Budżety czasu (aplikacja czeka na analizę maks. 285 s, więc całość mieści się z zapasem)
+const RESEARCH_MS = Number(process.env.RESEARCH_MS) || 60000;                 // jeden model w badaniu sieci (wyszukiwanie trwa dłużej)
+const RESEARCH_BUDGET_MS = Number(process.env.RESEARCH_BUDGET_MS) || 100000;   // całe badanie sieci
+const TOTAL_BUDGET_MS = Number(process.env.TOTAL_BUDGET_MS) || 240000;         // badanie + analiza razem
 
 // Czas życia pamięci podręcznej
 const TTL = {
@@ -51,6 +55,7 @@ const TTS_STYLES = {
 const isQuota = e => /429|RESOURCE_EXHAUSTED|exceeded your current quota/i.test(String(e?.message || e));
 // Model, który zwrócił 429 (limit) lub 404 (nie istnieje), jest chwilowo pomijany — bez marnowania czasu i zapytań na odrzucane próby
 const blocked = new Map();
+// Blokowanie dla GŁOSU (bez zmian)
 function blockFor(e) {
     const m = String(e?.message || e);
     if (/not found|NOT_FOUND|no longer available|\b404\b/i.test(m)) return 6 * 3600e3;          // model nie istnieje → 6 h
@@ -59,6 +64,29 @@ function blockFor(e) {
 }
 const isBlocked = m => (blocked.get(m) || 0) > Date.now();
 setInterval(() => { const n = Date.now(); for (const [k, t] of blocked) if (t <= n) blocked.delete(k); }, 10 * 60e3).unref();
+
+// Blokowanie dla modeli TEKSTOWYCH: czas z komunikatu Google („retry in Xs”), a przy powtarzających się 429 coraz dłużej (1 min → 5 → 30 → 60)
+const strikes = new Map(); // model -> { n, t }
+const retryHint = e => {
+    const m = String(e?.message || e);
+    const a = m.match(/retry in ([\d.]+)\s*s/i) || m.match(/"retryDelay"\s*:\s*"(\d+)s"/i);
+    return a ? Math.ceil(Number(a[1]) * 1000) + 2000 : 0;
+};
+function blockForText(e, model) {
+    const m = String(e?.message || e), now = Date.now();
+    if (/not found|NOT_FOUND|no longer available|\b404\b/i.test(m)) return 6 * 3600e3;
+    if (isQuota(e)) {
+        const s = strikes.get(model), n = (s && now - s.t < 2 * 3600e3) ? s.n + 1 : 1;
+        strikes.set(model, { n, t: now });
+        if (/PerDay|per day|daily/i.test(m)) return 60 * 60e3;
+        return Math.max(retryHint(e), [60e3, 5 * 60e3, 30 * 60e3, 60 * 60e3][Math.min(n - 1, 3)]);
+    }
+    if (/przekroczono limit/.test(m)) return 2 * 60e3;                                            // timeout → model odpoczywa 2 min
+    if (/\b(500|503)\b|UNAVAILABLE|overloaded/i.test(m)) return 2 * 60e3;
+    return 0;
+}
+setInterval(() => { const n = Date.now(); for (const [k, v] of strikes) if (n - v.t > 2 * 3600e3) strikes.delete(k); }, 30 * 60e3).unref();
+
 const withTimeout = (p, ms, label) => Promise.race([
     p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: przekroczono limit ${Math.round(ms / 1000)}s`)), ms))
 ]);
@@ -119,29 +147,40 @@ async function genOne(prompt, search, ms, model, think) {
         if (search) req.tools = [{ type: 'google_search' }];
         const i = await withTimeout(ai.interactions.create(req), ms, `Analiza (${model})`);
         if (!i.output_text) throw new Error('pusta odpowiedź');
+        strikes.delete(model);
         return { text: i.output_text, model, via: 'interactions', sources: collectSources(i) };
     } catch (e) {
         if (/przekroczono limit/.test(e.message) || isQuota(e)) throw e;
+        // drugie zapytanie (generateContent) tylko gdy Interactions go nie obsługuje; przy 404 i 5xx to strata zapytania
+        if (!/\b400\b|INVALID_ARGUMENT|not supported|pusta odpowiedź|TypeError|Cannot read|is not a function/i.test(e.message)) throw e;
         console.error(`Interactions (${model}) nie wyszło:`, e.message);
     }
     const r = await gen(prompt, search, ms, model, noThink(model) ? null : think);
+    strikes.delete(model);
     const chunks = r.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
     return { text: r.text, model, via: 'generateContent', sources: chunks.map(c => c.web?.uri).filter(Boolean) };
 }
 
-// Modele PO KOLEI: każdy dostaje pełne `ms`; błąd = od razu następny; pomijamy modele wstrzymane (limit / brak modelu)
-async function genSeq(prompt, search, ms, think, models = TEXT_MODELS, maxAttempts = MAX_ATTEMPTS) {
+// Modele PO KOLEI: każdy dostaje pełne `ms` (nie więcej niż zostało z budżetu); błąd = od razu następny; pomijamy modele wstrzymane (limit / brak modelu / timeout).
+// Odrzucenia 429 i 404 przychodzą od razu, więc nie zużywają limitu prób.
+async function genSeq(prompt, search, ms, think, models = TEXT_MODELS, maxAttempts = MAX_ATTEMPTS, deadline = Infinity) {
     const t0 = Date.now(), errs = [];
     let attempts = 0;
     for (const m of models) {
         if (attempts >= maxAttempts) break;
+        const left = deadline - Date.now();
+        if (left < 8000) { errs.push('budżet czasu wyczerpany'); break; }
         if (isBlocked(m)) { errs.push(`${m}: 429 RESOURCE_EXHAUSTED — model wstrzymany po przekroczeniu limitu`); continue; }
         attempts++;
         try {
-            const r = await genOne(prompt, search, ms, m, think);
+            const r = await genOne(prompt, search, Math.min(ms, left), m, think);
             console.log(`Model OK (${r.model}, ${r.via}${search ? ', z wyszukiwaniem' : ''}, think=${think}): ${Date.now() - t0} ms`);
             return r;
-        } catch (e) { errs.push(`${m}: ${e.message}`); console.error('Model zawiódł:', e.message); const b = blockFor(e); if (b) blocked.set(m, Date.now() + b); }
+        } catch (e) {
+            errs.push(`${m}: ${e.message}`); console.error('Model zawiódł:', e.message);
+            const b = blockForText(e, m); if (b) blocked.set(m, Date.now() + b);
+            if (isQuota(e) || /not found|NOT_FOUND|\b404\b/i.test(e.message)) attempts--;   // natychmiastowe odrzucenie nie zużywa próby
+        }
     }
     throw new Error(errs.join(' | '));
 }
@@ -269,7 +308,7 @@ function lastSessionNote(current, cal, live) {
 // ═══════════════ BADANIE SIECI (z pamięcią podręczną) ═══════════════
 // Zamiast wyszukiwać w sieci przy KAŻDYM kliknięciu, robimy to osobno i zapamiętujemy:
 //  • kalendarz/święta/wydarzenia — raz na dzień (model sam sprawdza w sieci, żadnych wgranych dat, działa w każdym roku),
-//  • rynek gier — raz na ~3 godziny dla danego zestawu gier.
+//  • rynek gier — raz na ~12 godzin dla danego zestawu gier.
 // Analiza końcowa nie używa już wyszukiwarki, więc jest szybka i tania.
 // JEDNO zapytanie z wyszukiwaniem (kalendarz + gry + rynek) zamiast dwóch — darmowy plan ma tylko ok. 20 zapytań dziennie na model.
 function researchPrompt(cal, games) {
@@ -293,7 +332,7 @@ setInterval(() => {
     if (lastNet && (Date.now() - lastNet.at > 12 * 3600e3 || lastNet.date !== calendarContext().dzis.dataISO)) lastNet = null;
 }, 10 * 60e3).unref();
 
-// Wynik badania zapamiętany na ok. 6 godzin (klucz: data + 6-godzinny blok + zestaw gier)
+// Wynik badania zapamiętany na 12 godzin (klucz: data + zestaw gier)
 async function research(body, cal, mode) {
     const date = cal.dzis.dataISO;
     const games = pickGames(body);
@@ -301,7 +340,7 @@ async function research(body, cal, mode) {
     const key = `net|${date}|${gk}`;   // ważne 12 h w ciągu tej samej doby, osobno dla danego zestawu gier
     try {
         const r = await cacheMain.memo(key, TTL.games, async () => {
-            const x = await genSeq(researchPrompt(cal, games), true, PER_MODEL_MS, 'low', RESEARCH_MODELS);
+            const x = await genSeq(researchPrompt(cal, games), true, RESEARCH_MS, 'low', RESEARCH_MODELS, 4, Date.now() + RESEARCH_BUDGET_MS);
             lastNet = { date, gk, text: x.text?.trim() || '', sources: x.sources || [], at: Date.now() };
             return x;
         });
@@ -363,7 +402,7 @@ C. Tytuł i gra a wyniki: przy „DROP”/„drops” w tytule sprawdź, czy wzr
 D. Korelacje: więcej widzów + więcej wiadomości = dobry znak; mało widzów, ale obecnych długo = stabilna publiczność; mało widzów i pisze ta sama grupa (wysoki udział czatujących) = własne grono. Wskaż, która sytuacja wygląda na prawdziwą.
 E. Rajdy: "skokiWidzow" = nagły wzrost z szybkim odpływem. Powiedz, że to prawdopodobnie rajd lub hosting (hipoteza), jak wygląda widownia „bazowa” bez skoku. Bez nicków.
 F. Czas trwania: nie porównuj sesji 1:1 — używaj wartości na godzinę z "porownanieNajnowszejSesji" i wspominaj o różnicy długości.
-G0. Kiedy wpadają followy: pole "followyKiedy" (liczby followów w ostatnich 30 dniach wg godziny czasu polskiego 0–23 i dnia tygodnia pon–niedz, oraz jaki ułamek wpadł podczas streamów). Wskaż godziny i dni, w których followy wpadają najczęściej, i podaj prawdopodobne przyczyny — wyłącznie jako obserwację (zasada 3), bez rad zmiany pory streamowania. Przy małej próbce (poniżej ok. 20 followów) powiedz, że to za mało danych na wnioski; nie przesadzaj ze znaczeniem pojedynczych liczb.
+G0. Kiedy wpadają followy: pole "followyKiedy" (liczby followów w ostatnich 30 dniach wg godziny czasu polskiego 0–23 i dnia tygodnia pon–niedz, oraz jaki ułamek wpadł podczas streamów). Wskaż godziny i dni, w których followy wpadają najczęściej, i podaj prawdopodobne przyczyny — wyłącznie jako obserwację (zasada 3), bez rad zmiany pory streamowania. Przy małej próbce (poniżej ok. 20 followów) powiedz, że to za mało danych na wnioski; nie przesadzaj ze znaczeniem pojedynczych liczb. Dane followyKiedy obejmują dokładnie ostatnie 30 dni — nigdy nie mów o 60 dniach.
 G. Tempo rozwoju: followersi w 30 dni i wzrost procentowy, saldo po unfollowach, suby (nowe i wygasłe), data ostatniego followa i suba. Nazwij dobry okres, jeśli rosną. Zaznacz, że część danych subów jest przybliżona.
 H. Zawsze szukaj PRZYCZYN odchyleń, nie samego „o 5% więcej niż zwykle”.
 ${modeBlock}
@@ -530,11 +569,12 @@ app.post('/api/analyze', async (req, res) => {
         if (body.odswiez) cacheMain.del(key);
 
         const result = await cacheMain.memo(key, live ? TTL.analysisLive : TTL.analysisOffline, async () => {
+            const tStart = Date.now();
             const derived = derive(currentSession, sessionsHistory);
             const ctx = await research(body, cal, mode);           // zwykle z pamięci podręcznej
             const searchUsed = !!ctx.net;
             const prompt = buildPrompt({ ...body, live, currentSession: withClock(currentSession), sessionsHistory: sessionsHistory.map(withClock) }, cal, derived, ctx);
-            const r = await genSeq(prompt, false, PER_MODEL_MS, THINK[mode], TEXT_MODELS);
+            const r = await genSeq(prompt, false, PER_MODEL_MS, THINK[mode], TEXT_MODELS, TEXT_MODELS.length, tStart + TOTAL_BUDGET_MS);
             const parsed = String(r.text).trim().startsWith('{') ? parseJson(r.text) : null;
             const text = cleanSpeech(parsed?.audioPrompt || parsed?.textResponse || r.text);
             if (!text) throw new Error('Pusta odpowiedź modelu');
