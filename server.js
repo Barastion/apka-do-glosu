@@ -12,26 +12,36 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Modele można zmienić w Render → Environment bez ruszania kodu (TEXT_MODEL / TTS_MODEL)
 const TEXT_MODEL = process.env.TEXT_MODEL || 'gemini-3.8-flash';
-const TTS_MODELS = [process.env.TTS_MODEL || 'gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
+const list = (v, def) => String(v || def).split(',').map(x => x.trim()).filter(Boolean);
+// GŁOS: główny + zapasowe (każdy model TTS ma osobny limit dzienny). Zmienisz w Render → Environment: TTS_MODEL, TTS_MODEL_FALLBACKS (po przecinku).
+const TTS_MODELS = [...new Set([process.env.TTS_MODEL || 'gemini-3.8-flash-tts', ...list(process.env.TTS_MODEL_FALLBACKS, 'gemini-3.8-flash-lite-tts,gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts')])];
 const TTS_VOICE = process.env.TTS_VOICE || 'Kore';
 // Modele tekstowe są próbowane PO KOLEI (zapasowy tylko gdy główny zawiedzie) — nie równolegle, bo to podwajało zużycie limitu
-const TEXT_MODELS = [...new Set([TEXT_MODEL, process.env.TEXT_MODEL_FALLBACK || 'gemini-3.7-flash'])];
+// Kolejność: główny → zapasowe. Zapasowe z env TEXT_MODEL_FALLBACKS (po przecinku), np. "gemini-3.7-flash,gemini-2.5-flash-lite".
+// Każdy model ma OSOBNE limity, więc po wyczerpaniu jednego serwer przechodzi na następny. Model, którego nie ma (404), jest pomijany.
+// ANALIZA: najmocniejszy model pierwszy, potem zapasowe (env TEXT_MODEL_FALLBACKS). Flash-Lite mają na Twoim koncie 500 zapytań/dzień.
+const TEXT_MODELS = [...new Set([TEXT_MODEL, ...list(process.env.TEXT_MODEL_FALLBACKS || process.env.TEXT_MODEL_FALLBACK, 'gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash')])];
+// BADANIE SIECI (wyszukiwanie): proste streszczenie, więc najpierw lekkie modele z dużym limitem dziennym (env RESEARCH_MODELS).
+const RESEARCH_MODELS = [...new Set(list(process.env.RESEARCH_MODELS, 'gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.8-flash'))];
+// modele, które nie przyjmują poziomu „myślenia” (Gemma, seria 2.5) — nie wysyłamy go, żeby nie marnować zapytań na odrzucenia
+const noThink = m => /gemma|2\.5/i.test(m);
 
 // Poziom „myślenia” (zmienne środowiskowe THINK_LIVE / THINK_OFFLINE). Liczby są policzone w kodzie, więc 'low' w zupełności wystarcza na żywo.
-const THINK = { live: process.env.THINK_LIVE || 'low', offline: process.env.THINK_OFFLINE || 'medium' };
+const THINK = { live: process.env.THINK_LIVE || 'low', offline: process.env.THINK_OFFLINE || 'low' };
 
 // Limity czasu (ms): badanie sieci (równolegle), analiza końcowa, całość
 const LIMITS = {
-    live:    { research: 30000, analysis: 35000, total: 72000 },
-    offline: { research: 45000, analysis: 55000, total: 115000 }
+    // research = limit jednej próby badania sieci, researchStage = limit CAŁEGO etapu badania (żeby nie zabierał czasu analizie),
+    // analysis = limit jednej próby modelu przy analizie (45 s na model), total = limit całości (90 s)
+    live:    { research: 30000, researchStage: 32000, analysis: 45000, total: 120000 },
+    offline: { research: 30000, researchStage: 32000, analysis: 45000, total: 120000 }
 };
 
 // Czas życia pamięci podręcznej
 const TTL = {
-    analysisLive: 4 * 60e3,       // dwa kliknięcia w ciągu 4 min = ta sama analiza (0 zapytań)
+    analysisLive: 60 * 60e3,      // kolejne kliknięcia w ciągu godziny (ta sama gra i tytuł) = ta sama analiza (0 zapytań)
     analysisOffline: 2 * 3600e3,  // offline dane się nie zmieniają, więc analiza ważna 2 h (lub do zmiany danych)
-    calendar: 10 * 3600e3,        // święta/wydarzenia sprawdzane w sieci RAZ NA DZIEŃ
-    games: 3 * 3600e3,            // rynek gier (widzowie/streamujący, patche) RAZ NA 3 GODZINY
+    games: 6 * 3600e3,            // badanie sieci (kalendarz, gry, rynek) RAZ NA 6 GODZIN dla danego zestawu gier
     audio: 6 * 3600e3
 };
 
@@ -42,6 +52,15 @@ const TTS_STYLES = {
 };
 
 const isQuota = e => /429|RESOURCE_EXHAUSTED|exceeded your current quota/i.test(String(e?.message || e));
+// Model, który zwrócił 429 (limit) lub 404 (nie istnieje), jest chwilowo pomijany — bez marnowania czasu i zapytań na odrzucane próby
+const blocked = new Map();
+function blockFor(e) {
+    const m = String(e?.message || e);
+    if (/not found|NOT_FOUND|no longer available|\b404\b/i.test(m)) return 6 * 3600e3;          // model nie istnieje → 6 h
+    if (isQuota(e)) return /PerDay|per day|daily/i.test(m) ? 30 * 60e3 : 90e3;                    // limit dzienny → 30 min, minutowy → 90 s
+    return 0;
+}
+const isBlocked = m => (blocked.get(m) || 0) > Date.now();
 const withTimeout = (p, ms, label) => Promise.race([
     p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: przekroczono limit ${Math.round(ms / 1000)}s`)), ms))
 ]);
@@ -74,7 +93,7 @@ const J = o => JSON.stringify(o, (k, v) => (v === null || v === '' || (Array.isA
 // Klasyczne generateContent (plan B dla Interactions API)
 async function gen(prompt, search, ms, model, think) {
     const base = search ? { tools: [{ googleSearch: {} }] } : {};
-    const tries = [{ ...base, thinkingConfig: { thinkingLevel: think } }, base];
+    const tries = think ? [{ ...base, thinkingConfig: { thinkingLevel: think } }, base] : [base];
     let last = null;
     for (const config of tries) {
         try {
@@ -96,7 +115,9 @@ function collectSources(i) {
 
 async function genOne(prompt, search, ms, model, think) {
     try {
-        const req = { model, input: prompt, generation_config: { thinking_level: think } };
+        const th = noThink(model) ? null : think;
+        const req = { model, input: prompt };
+        if (th) req.generation_config = { thinking_level: th };
         if (search) req.tools = [{ type: 'google_search' }];
         const i = await withTimeout(ai.interactions.create(req), ms, `Analiza (${model})`);
         if (!i.output_text) throw new Error('pusta odpowiedź');
@@ -105,23 +126,24 @@ async function genOne(prompt, search, ms, model, think) {
         if (/przekroczono limit/.test(e.message) || isQuota(e)) throw e;
         console.error(`Interactions (${model}) nie wyszło:`, e.message);
     }
-    const r = await gen(prompt, search, ms, model, think);
+    const r = await gen(prompt, search, ms, model, noThink(model) ? null : think);
     const chunks = r.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
     return { text: r.text, model, via: 'generateContent', sources: chunks.map(c => c.web?.uri).filter(Boolean) };
 }
 
 // Modele PO KOLEI: zapasowy dopiero, gdy główny zawiódł i zostało dość czasu do końcowego terminu
-async function genSeq(prompt, search, ms, think, deadline) {
+async function genSeq(prompt, search, ms, think, deadline, models = TEXT_MODELS) {
     const t0 = Date.now();
     const errs = [];
-    for (const m of TEXT_MODELS) {
+    for (const m of models) {
         const left = deadline - Date.now();
+        if (isBlocked(m)) { errs.push(`${m}: 429 RESOURCE_EXHAUSTED — model wstrzymany po przekroczeniu limitu`); continue; }
         if (left < 8000) { errs.push(`${m}: brak czasu na kolejną próbę`); break; }
         try {
             const r = await genOne(prompt, search, Math.min(ms, left), m, think);
             console.log(`Model OK (${r.model}, ${r.via}${search ? ', z wyszukiwaniem' : ''}, think=${think}): ${Date.now() - t0} ms`);
             return r;
-        } catch (e) { errs.push(`${m}: ${e.message}`); console.error('Model zawiódł:', e.message); }
+        } catch (e) { errs.push(`${m}: ${e.message}`); console.error('Model zawiódł:', e.message); const b = blockFor(e); if (b) blocked.set(m, Date.now() + b); }
     }
     throw new Error(errs.join(' | '));
 }
@@ -251,17 +273,12 @@ function lastSessionNote(current, cal, live) {
 //  • kalendarz/święta/wydarzenia — raz na dzień (model sam sprawdza w sieci, żadnych wgranych dat, działa w każdym roku),
 //  • rynek gier — raz na ~3 godziny dla danego zestawu gier.
 // Analiza końcowa nie używa już wyszukiwarki, więc jest szybka i tania.
-function calendarResearchPrompt(cal) {
-    return `Dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Sprawdź w sieci i podaj WYŁĄCZNIE fakty potwierdzone dla DZISIAJ i najbliższych 7 dni w Polsce:
-1) święta państwowe i kościelne, dni wolne od pracy, długi weekend lub „most”;
-2) okres: wakacje, ferie (zimowe z podziałem na województwa, jeśli trwają), okres przedświąteczny, matury i egzaminy, pora roku;
-3) wydarzenia odciągające Polaków od Twitcha lub ściągające na niego: mecze reprezentacji Polski, duże gale freak-fightowe, finały turniejów e-sportowych (np. IEM Katowice), ważne premiery i największe wydarzenia na Twitchu.
-Wydarzenia z przeszłości tylko z ostatnich 7 dni i tylko jeśli realnie wpływają na Twitcha. Użyj maksymalnie 2–3 wyszukiwań. Odpowiedz krótkimi punktami (maks. 120 słów), z datami. Bez nazw firm, portali i serwisów (wyjątek: gry, studia, wydawcy, Twitch) i bez linków. Jeśli czegoś nie potwierdzisz — pomiń to; jeśli nic nie ma, napisz „Brak potwierdzonych wydarzeń”. Na początku w jednym zdaniu: czy dziś to dzień roboczy, weekend lub wolny od pracy.`;
-}
-function gamesResearchPrompt(cal, games) {
-    return `Dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Gry streamowane ostatnio na polskim kanale Twitch (od najświeższej): ${games.join('; ')}.
-Sprawdź w sieci dla każdej z nich: (a) oglądalność w Polsce i miejsce na tle czołowych gier polskiego Twitcha; (b) stosunek liczby widzów do liczby streamujących i w jakie dni/godziny bywa najkorzystniejszy (tylko informacja); (c) patche, aktualizacje, premiery, dropy i eventy dziejące się DZIŚ lub w przyszłości (podaj kiedy) albo z ostatnich 7 dni, jeśli realnie wpływają na Twitcha. Dodatkowo: jaka inna duża gra lub wydarzenie na Twitchu ściąga teraz widzów w Polsce.
-Użyj maksymalnie 3 wyszukiwań. Odpowiedz krótkimi punktami (maks. 170 słów), jeden blok na grę. Nie zmyślaj liczb — jeśli czegoś nie da się sprawdzić, napisz to wprost. Bez nazw firm, portali i serwisów (wyjątek: gry, studia, wydawcy, Twitch) i bez linków.`;
+// JEDNO zapytanie z wyszukiwaniem (kalendarz + gry + rynek) zamiast dwóch — darmowy plan ma tylko ok. 20 zapytań dziennie na model.
+function researchPrompt(cal, games) {
+    return `Dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Sprawdź w sieci i podaj WYŁĄCZNIE fakty potwierdzone dla DZISIAJ i najbliższych 7 dni w Polsce.
+CZĘŚĆ 1 — KALENDARZ: święta państwowe i kościelne, dni wolne, długi weekend lub „most”; wakacje, ferie (zimowe z podziałem na województwa), okres przedświąteczny, matury i egzaminy, pora roku; wydarzenia odciągające Polaków od Twitcha lub ściągające na niego: mecze reprezentacji Polski, duże gale freak-fightowe, finały e-sportowe (np. IEM Katowice), ważne premiery i największe wydarzenia na Twitchu. Zacznij od jednego zdania: czy dziś to dzień roboczy, weekend czy dzień wolny.
+${games.length ? `CZĘŚĆ 2 — GRY streamowane ostatnio na polskim kanale (od najświeższej): ${games.join('; ')}. Dla każdej: oglądalność w Polsce i miejsce na tle czołówki polskiego Twitcha; stosunek widzów do streamujących i kiedy bywa najkorzystniejszy (tylko informacja); patche, aktualizacje, premiery, dropy i eventy DZIŚ, w przyszłości lub z ostatnich 7 dni (jeśli realnie wpływają na Twitcha). Dodatkowo: jaka inna duża gra lub wydarzenie na Twitchu ściąga teraz widzów w Polsce.` : 'CZĘŚĆ 2 — pomiń gry (brak danych); podaj tylko, jaka duża gra lub wydarzenie na Twitchu ściąga teraz widzów w Polsce.'}
+Użyj maksymalnie 4 wyszukiwań. Odpowiedz krótkimi punktami (maks. 260 słów) z podziałem na „KALENDARZ” i „GRY”. Nie zmyślaj liczb; czego nie da się sprawdzić, napisz wprost; jeśli w kalendarzu nic nie potwierdzisz, napisz „Brak potwierdzonych wydarzeń”. Bez nazw firm, portali i serwisów (wyjątek: gry, studia, wydawcy, Twitch) i bez linków.`;
 }
 function pickGames(body) {
     const seen = [], add = g => { if (g && typeof g === 'string' && !seen.some(x => x.toLowerCase() === g.toLowerCase())) seen.push(g.trim()); };
@@ -271,23 +288,36 @@ function pickGames(body) {
     return seen.slice(0, 3);
 }
 
+// Ostatnie udane badanie sieci: używane TYLKO gdy świeże się nie uda (np. limit Gemini), wyłącznie z tej samej doby i do 12 h.
+// Potem jest kasowane (sprawdzanie co 10 min), więc stare dane nie leżą w nieskończoność.
+let lastNet = null; // { date, gk, text, sources, at }
+setInterval(() => {
+    if (lastNet && (Date.now() - lastNet.at > 12 * 3600e3 || lastNet.date !== calendarContext().dzis.dataISO)) lastNet = null;
+}, 10 * 60e3).unref();
+
+// Wynik badania zapamiętany na ok. 6 godzin (klucz: data + 6-godzinny blok + zestaw gier)
 async function research(body, cal, mode) {
-    const lim = LIMITS[mode], think = 'low';
-    const date = cal.dzis.dataISO, block = Math.floor(parseInt(cal.dzis.godzina, 10) / 3);
+    const lim = LIMITS[mode];
+    const date = cal.dzis.dataISO, block = Math.floor(parseInt(cal.dzis.godzina, 10) / 6);
     const games = pickGames(body);
-    const job = (key, ttl, prompt) => cacheMain.memo(key, ttl, () => genSeq(prompt, true, lim.research, think, Date.now() + lim.research + 4000));
-    const [c, g] = await Promise.allSettled([
-        job(`cal|${date}`, TTL.calendar, calendarResearchPrompt(cal)),
-        games.length ? job(`games|${date}|${block}|${games.map(x => x.toLowerCase()).sort().join('+')}`, TTL.games, gamesResearchPrompt(cal, games)) : Promise.reject(new Error('brak gier'))
-    ]);
-    const val = r => r.status === 'fulfilled' ? r.value : null;
-    [c, g].forEach((r, i) => { if (r.status === 'rejected' && !(i === 1 && !games.length)) console.error('Badanie sieci nieudane:', r.reason?.message); });
-    return {
-        calendar: val(c)?.text?.trim() || null,
-        games: val(g)?.text?.trim() || null,
-        gamesList: games,
-        sources: [...new Set([...(val(c)?.sources || []), ...(val(g)?.sources || [])])]
-    };
+    const gk = games.map(x => x.toLowerCase()).sort().join('+');
+    const key = `net|${date}|${block}|${gk}`;
+    try {
+        const r = await cacheMain.memo(key, TTL.games, async () => {
+            const x = await genSeq(researchPrompt(cal, games), true, lim.research, 'low', Date.now() + lim.researchStage, RESEARCH_MODELS);
+            lastNet = { date, gk, text: x.text?.trim() || '', sources: x.sources || [], at: Date.now() };
+            return x;
+        });
+        return { net: r.text?.trim() || null, sources: r.sources || [] };
+    } catch (e) {
+        console.error('Badanie sieci nieudane:', e.message);
+        if (lastNet && lastNet.text && lastNet.date === date && lastNet.gk === gk && Date.now() - lastNet.at < 12 * 3600e3) {
+            const h = Math.max(1, Math.round((Date.now() - lastNet.at) / 36e5));
+            console.log('Używam ostatnich zapamiętanych notatek z sieci (sprzed ' + h + ' h)');
+            return { net: lastNet.text + `\n(Uwaga: te notatki z sieci pochodzą sprzed ok. ${h} godz. i mogły się zmienić.)`, sources: lastNet.sources };
+        }
+        return { net: null, sources: [] };
+    }
 }
 
 // ═══════════════ PROMPT ANALIZY ═══════════════
@@ -313,8 +343,8 @@ TRYB: STREAM ZAKOŃCZONY / OFFLINE.
 - Styl: analityczny, spokojny, rzeczowy. Bez CTA do widzów.
 - Długość: ok. 280–320 słów (do 2 minut mówienia).`;
 
-    const netBlock = (ctx.calendar || ctx.games)
-        ? `KALENDARZ I WYDARZENIA (sprawdzone w sieci na dziś):\n${ctx.calendar || 'nie udało się sprawdzić'}\n\nGRY I RYNEK TWITCHA (sprawdzone w sieci):\n${ctx.games || 'nie udało się sprawdzić'}`
+    const netBlock = ctx.net
+        ? `KALENDARZ, WYDARZENIA, GRY I RYNEK TWITCHA (sprawdzone w sieci na dziś):\n${ctx.net}`
         : 'Wyszukiwarka była niedostępna: bieżących danych z sieci (kalendarz, święta, gry, patche, wydarzenia, stosunek widzów do streamujących) NIE udało się sprawdzić — powiedz to krótko i niczego nie zmyślaj.';
 
     return `Jesteś analitykiem kanału Twitch streamera ${channelName} (polski rynek streamingowy). Masz dane z widżetu, wyliczenia z kodu oraz zweryfikowany w sieci kontekst. Nie wyszukujesz niczego sam — korzystaj tylko z poniższych danych.
@@ -391,6 +421,7 @@ async function makeAudio(text, models = TTS_MODELS, mode = 'offline') {
     let lastErr = null;
     const style = TTS_STYLES[mode] || TTS_STYLES.offline;
     for (const model of models) {
+        if (isBlocked(model)) { lastErr = new Error(`TTS ${model}: 429 RESOURCE_EXHAUSTED — model wstrzymany po przekroczeniu limitu`); continue; }
         const attempts = Date.now() < styleOffUntil ? [null] : [style, null];
         for (const st of attempts) {
             try {
@@ -415,6 +446,7 @@ async function makeAudio(text, models = TTS_MODELS, mode = 'offline') {
             } catch (e) {
                 lastErr = e;
                 console.error(`TTS (${model}${st ? ', ze stylem' : ', bez stylu'}) nie zadziałał:`, e.message);
+                const b = blockFor(e); if (b) { blocked.set(model, Date.now() + b); break; } // limit/brak modelu → od razu następny model
                 if (st) { styleOffUntil = Date.now() + 10 * 60e3; continue; }
                 break;
             }
@@ -505,7 +537,7 @@ app.post('/api/analyze', async (req, res) => {
             const lim = LIMITS[mode], deadline = Date.now() + lim.total;
             const derived = derive(currentSession, sessionsHistory);
             const ctx = await research(body, cal, mode);           // zwykle z pamięci podręcznej
-            const searchUsed = !!(ctx.calendar || ctx.games);
+            const searchUsed = !!ctx.net;
             const prompt = buildPrompt({ ...body, live, currentSession: withClock(currentSession), sessionsHistory: sessionsHistory.map(withClock) }, cal, derived, ctx);
             const r = await genSeq(prompt, false, lim.analysis, THINK[mode], deadline);
             const parsed = String(r.text).trim().startsWith('{') ? parseJson(r.text) : null;
