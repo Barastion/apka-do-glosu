@@ -20,9 +20,9 @@ const TTS_VOICE = process.env.TTS_VOICE || 'Kore';
 // Kolejność: główny → zapasowe. Zapasowe z env TEXT_MODEL_FALLBACKS (po przecinku), np. "gemini-3.7-flash,gemini-2.5-flash-lite".
 // Każdy model ma OSOBNE limity, więc po wyczerpaniu jednego serwer przechodzi na następny. Model, którego nie ma (404), jest pomijany.
 // ANALIZA: najmocniejszy model pierwszy, potem zapasowe (env TEXT_MODEL_FALLBACKS). Flash-Lite mają na Twoim koncie 500 zapytań/dzień.
-const TEXT_MODELS = [...new Set([TEXT_MODEL, ...list(process.env.TEXT_MODEL_FALLBACKS || process.env.TEXT_MODEL_FALLBACK, 'gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash')])];
+const TEXT_MODELS = [...new Set([TEXT_MODEL, ...list(process.env.TEXT_MODEL_FALLBACKS || process.env.TEXT_MODEL_FALLBACK, 'gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash,gemini-2.5-flash-lite')])];   // 2.5 = ostatnia warstwa zapasowa
 // BADANIE SIECI (wyszukiwanie): proste streszczenie, więc najpierw lekkie modele z dużym limitem dziennym (env RESEARCH_MODELS).
-const RESEARCH_MODELS = [...new Set(list(process.env.RESEARCH_MODELS, 'gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.8-flash'))];
+const RESEARCH_MODELS = [...new Set(list(process.env.RESEARCH_MODELS, 'gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash,gemini-3.8-flash,gemini-2.5-flash,gemini-2.5-flash-lite'))];   // 2.5 = ostatnia warstwa zapasowa
 // modele, które nie przyjmują poziomu „myślenia” (Gemma, seria 2.5) — nie wysyłamy go, żeby nie marnować zapytań na odrzucenia
 const noThink = m => /gemma|2\.5/i.test(m);
 
@@ -69,8 +69,11 @@ setInterval(() => { const n = Date.now(); for (const [k, t] of blocked) if (t <=
 const strikes = new Map(); // model -> { n, t }
 const retryHint = e => {
     const m = String(e?.message || e);
-    const a = m.match(/retry in ([\d.]+)\s*s/i) || m.match(/"retryDelay"\s*:\s*"(\d+)s"/i);
-    return a ? Math.ceil(Number(a[1]) * 1000) + 2000 : 0;
+    const a = m.match(/retry in ((?:[\d.]+\s*h)?\s*(?:[\d.]+\s*m(?!s))?\s*(?:[\d.]+\s*s)?)/i) || m.match(/"retryDelay"\s*:\s*"([^"]+)"/i);
+    if (!a) return 0;
+    const t = a[1], g = re => { const x = t.match(re); return x ? Number(x[1]) : 0; };
+    const ms = (g(/([\d.]+)\s*h/i) * 3600 + g(/([\d.]+)\s*m(?!s)/i) * 60 + g(/([\d.]+)\s*s/i)) * 1000;
+    return ms ? Math.min(Math.ceil(ms) + 2000, 24 * 3600e3) : 0;
 };
 function blockForText(e, model) {
     const m = String(e?.message || e), now = Date.now();
@@ -78,7 +81,7 @@ function blockForText(e, model) {
     if (isQuota(e)) {
         const s = strikes.get(model), n = (s && now - s.t < 2 * 3600e3) ? s.n + 1 : 1;
         strikes.set(model, { n, t: now });
-        if (/PerDay|per day|daily/i.test(m)) return 60 * 60e3;
+        if (/PerDay|per day|daily/i.test(m)) return retryHint(e) || 60 * 60e3;
         return Math.max(retryHint(e), [60e3, 5 * 60e3, 30 * 60e3, 60 * 60e3][Math.min(n - 1, 3)]);
     }
     if (/przekroczono limit/.test(m)) return 2 * 60e3;                                            // timeout → model odpoczywa 2 min
@@ -145,7 +148,7 @@ async function genOne(prompt, search, ms, model, think) {
         const req = { model, input: prompt };
         if (th) req.generation_config = { thinking_level: th };
         if (search) req.tools = [{ type: 'google_search' }];
-        const i = await withTimeout(ai.interactions.create(req), ms, `Analiza (${model})`);
+        const i = await withTimeout(ai.interactions.create(req, { maxRetries: 0 }), ms, `Analiza (${model})`);   // maxRetries:0 — SDK domyślnie ponawia 429 do 4 razy (do 30 s), a to marnuje czas i zapytania
         if (!i.output_text) throw new Error('pusta odpowiedź');
         strikes.delete(model);
         return { text: i.output_text, model, via: 'interactions', sources: collectSources(i) };
@@ -383,7 +386,7 @@ TRYB: STREAM ZAKOŃCZONY / OFFLINE.
         ? `KALENDARZ, WYDARZENIA, GRY I RYNEK TWITCHA (sprawdzone w sieci na dziś):\n${ctx.net}`
         : 'Wyszukiwarka była niedostępna: bieżących danych z sieci (kalendarz, święta, gry, patche, wydarzenia, stosunek widzów do streamujących) NIE udało się sprawdzić — powiedz to krótko i niczego nie zmyślaj.';
 
-    return `Jesteś analitykiem kanału Twitch streamera ${channelName} (polski rynek streamingowy). Masz dane z widżetu, wyliczenia z kodu oraz zweryfikowany w sieci kontekst. Nie wyszukujesz niczego sam — korzystaj tylko z poniższych danych.
+    return `Jesteś analityczką kanału Twitch streamera ${channelName} (polski rynek streamingowy). Mówisz kobiecym głosem, więc zawsze używasz żeńskich form gramatycznych. Masz dane z widżetu, wyliczenia z kodu oraz zweryfikowany w sieci kontekst. Nie wyszukujesz niczego sam — korzystaj tylko z poniższych danych.
 
 ═══ ZASADY BEZWZGLĘDNE ═══
 1. Nigdy nie czytaj ani nie wymieniaj nicków i nazw użytkowników (poza nazwą ${channelName}). Nigdy nie mów o zarobkach, kwotach ani pieniądzach z subskrypcji, bitsów itp. Liczby followersów i subów wolno podawać.
@@ -392,7 +395,8 @@ TRYB: STREAM ZAKOŃCZONY / OFFLINE.
 4. Prawda, bez słodzenia, ale i bez pesymizmu: szukaj plusów, wspominaj minusy. Nie zmyślaj liczb. Odróżniaj twarde dane z historii, szacunki (pola „szac_”) i hipotezy. Czego nie da się sprawdzić — powiedz wprost.
 5. Świeżość: dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Wspominaj tylko wydarzenia z kontekstu z sieci (dzisiejsze, przyszłe lub z ostatnich 7 dni). Niepotwierdzonego nie wspominaj.
 6. Dopasuj analizę do polskich widzów i polskiego Twitcha.
-7. Zacznij od przedstawienia się jako analityk kanału ${channelName}, powiedz jaki jest dziś dzień, data i godzina. Następnie: ${note}
+6b. Mówisz jako kobieta: wszystkie czasowniki i przymiotniki o sobie w formie żeńskiej (np. „przeanalizowałam”, „sprawdziłam”, „zauważyłam”, „nie udało mi się”, „jestem pewna”), nigdy w męskiej („przeanalizowałem”, „sprawdziłem”).
+7. Zacznij od przedstawienia się jako analityczka kanału ${channelName}, powiedz jaki jest dziś dzień, data i godzina. Następnie: ${note}
 
 ═══ CO ANALIZOWAĆ ═══
 A. Wzorce: gry, dni tygodnia, godziny startu i końca. Najlepsze godziny i dni bierz z "wyliczeniaSerwera" (nie licz w pamięci) i szukaj PRZYCZYN (początek weekendu, święto, wakacje/ferie, pora roku, wydarzenia z kontekstu).
@@ -557,7 +561,7 @@ app.post('/api/analyze', async (req, res) => {
         const mode = live ? 'live' : 'offline';
 
         if (noData) {
-            const txt = `Cześć! Tu analityk kanału ${channelName}. Na razie nie mam zapisanych żadnych zakończonych sesji ani danych kanału, więc nie ma jeszcze czego analizować. Po pierwszej zakończonej transmisji omówię wyniki, a potem szerszy obraz polskiego Twitcha.`;
+            const txt = `Cześć! Tu analityczka kanału ${channelName}. Na razie nie mam zapisanych żadnych zakończonych sesji ani danych kanału, więc nie ma jeszcze czego analizować. Po pierwszej zakończonej transmisji omówię wyniki, a potem szerszy obraz polskiego Twitcha.`;
             return res.json({ success: true, analysis: txt, audioPrompt: txt, searchUsed: false, sources: [], mode });
         }
 
