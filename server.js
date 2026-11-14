@@ -29,20 +29,17 @@ const noThink = m => /gemma|2\.5/i.test(m);
 // Poziom „myślenia” (zmienne środowiskowe THINK_LIVE / THINK_OFFLINE). Liczby są policzone w kodzie, więc 'low' w zupełności wystarcza na żywo.
 const THINK = { live: process.env.THINK_LIVE || 'low', offline: process.env.THINK_OFFLINE || 'low' };
 
-// Limity czasu (ms): badanie sieci (równolegle), analiza końcowa, całość
-const LIMITS = {
-    // research = limit jednej próby badania sieci, researchStage = limit CAŁEGO etapu badania (żeby nie zabierał czasu analizie),
-    // analysis = limit jednej próby modelu przy analizie (45 s na model), total = limit całości (90 s)
-    live:    { research: 30000, researchStage: 32000, analysis: 45000, total: 120000 },
-    offline: { research: 30000, researchStage: 32000, analysis: 45000, total: 120000 }
-};
+// Czas: KAŻDY model ma własne 45 s (PER_MODEL_MS). Gdy model zwróci błąd (np. 429), przechodzimy do następnego od razu, bez czekania.
+// Najwyżej MAX_ATTEMPTS prób na etap (badanie sieci / analiza). Render dopuszcza do 100 min na jedno zapytanie, więc to bezpieczne.
+const PER_MODEL_MS = Number(process.env.PER_MODEL_MS) || 45000;
+const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS) || 3;
 
 // Czas życia pamięci podręcznej
 const TTL = {
-    analysisLive: 60 * 60e3,      // kolejne kliknięcia w ciągu godziny (ta sama gra i tytuł) = ta sama analiza (0 zapytań)
-    analysisOffline: 2 * 3600e3,  // offline dane się nie zmieniają, więc analiza ważna 2 h (lub do zmiany danych)
-    games: 6 * 3600e3,            // badanie sieci (kalendarz, gry, rynek) RAZ NA 6 GODZIN dla danego zestawu gier
-    audio: 6 * 3600e3
+    analysisLive: 15 * 60e3,      // na żywo: ta sama analiza (i nagranie) przez 15 min dla tej samej gry i tytułu (0 zapytań)
+    analysisOffline: 60 * 60e3,   // offline: ta sama analiza przez 1 h
+    games: 12 * 3600e3,           // notatki z sieci (kalendarz, gry, rynek) ważne 12 h w ciągu tej samej doby
+    audio: 2 * 3600e3             // nagrania kasowane po 2 h
 };
 
 // Style głosu: na żywo — radiowy, lekko komentatorski; offline — analityczny (głos nadal kobiecy: Kore)
@@ -61,6 +58,7 @@ function blockFor(e) {
     return 0;
 }
 const isBlocked = m => (blocked.get(m) || 0) > Date.now();
+setInterval(() => { const n = Date.now(); for (const [k, t] of blocked) if (t <= n) blocked.delete(k); }, 10 * 60e3).unref();
 const withTimeout = (p, ms, label) => Promise.race([
     p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: przekroczono limit ${Math.round(ms / 1000)}s`)), ms))
 ]);
@@ -131,16 +129,16 @@ async function genOne(prompt, search, ms, model, think) {
     return { text: r.text, model, via: 'generateContent', sources: chunks.map(c => c.web?.uri).filter(Boolean) };
 }
 
-// Modele PO KOLEI: zapasowy dopiero, gdy główny zawiódł i zostało dość czasu do końcowego terminu
-async function genSeq(prompt, search, ms, think, deadline, models = TEXT_MODELS) {
-    const t0 = Date.now();
-    const errs = [];
+// Modele PO KOLEI: każdy dostaje pełne `ms`; błąd = od razu następny; pomijamy modele wstrzymane (limit / brak modelu)
+async function genSeq(prompt, search, ms, think, models = TEXT_MODELS, maxAttempts = MAX_ATTEMPTS) {
+    const t0 = Date.now(), errs = [];
+    let attempts = 0;
     for (const m of models) {
-        const left = deadline - Date.now();
+        if (attempts >= maxAttempts) break;
         if (isBlocked(m)) { errs.push(`${m}: 429 RESOURCE_EXHAUSTED — model wstrzymany po przekroczeniu limitu`); continue; }
-        if (left < 8000) { errs.push(`${m}: brak czasu na kolejną próbę`); break; }
+        attempts++;
         try {
-            const r = await genOne(prompt, search, Math.min(ms, left), m, think);
+            const r = await genOne(prompt, search, ms, m, think);
             console.log(`Model OK (${r.model}, ${r.via}${search ? ', z wyszukiwaniem' : ''}, think=${think}): ${Date.now() - t0} ms`);
             return r;
         } catch (e) { errs.push(`${m}: ${e.message}`); console.error('Model zawiódł:', e.message); const b = blockFor(e); if (b) blocked.set(m, Date.now() + b); }
@@ -297,24 +295,23 @@ setInterval(() => {
 
 // Wynik badania zapamiętany na ok. 6 godzin (klucz: data + 6-godzinny blok + zestaw gier)
 async function research(body, cal, mode) {
-    const lim = LIMITS[mode];
-    const date = cal.dzis.dataISO, block = Math.floor(parseInt(cal.dzis.godzina, 10) / 6);
+    const date = cal.dzis.dataISO;
     const games = pickGames(body);
     const gk = games.map(x => x.toLowerCase()).sort().join('+');
-    const key = `net|${date}|${block}|${gk}`;
+    const key = `net|${date}|${gk}`;   // ważne 12 h w ciągu tej samej doby, osobno dla danego zestawu gier
     try {
         const r = await cacheMain.memo(key, TTL.games, async () => {
-            const x = await genSeq(researchPrompt(cal, games), true, lim.research, 'low', Date.now() + lim.researchStage, RESEARCH_MODELS);
+            const x = await genSeq(researchPrompt(cal, games), true, PER_MODEL_MS, 'low', RESEARCH_MODELS);
             lastNet = { date, gk, text: x.text?.trim() || '', sources: x.sources || [], at: Date.now() };
             return x;
         });
         return { net: r.text?.trim() || null, sources: r.sources || [] };
     } catch (e) {
         console.error('Badanie sieci nieudane:', e.message);
-        if (lastNet && lastNet.text && lastNet.date === date && lastNet.gk === gk && Date.now() - lastNet.at < 12 * 3600e3) {
+        if (lastNet && lastNet.text && lastNet.date === date && Date.now() - lastNet.at < 12 * 3600e3) {
             const h = Math.max(1, Math.round((Date.now() - lastNet.at) / 36e5));
             console.log('Używam ostatnich zapamiętanych notatek z sieci (sprzed ' + h + ' h)');
-            return { net: lastNet.text + `\n(Uwaga: te notatki z sieci pochodzą sprzed ok. ${h} godz. i mogły się zmienić.)`, sources: lastNet.sources };
+            return { net: lastNet.text + `\n(Uwaga: te notatki z sieci pochodzą sprzed ok. ${h} godz., mogły się zmienić${lastNet.gk !== gk ? ' i część o grach może dotyczyć innych gier' : ''}.)`, sources: lastNet.sources };
         }
         return { net: null, sources: [] };
     }
@@ -526,20 +523,18 @@ app.post('/api/analyze', async (req, res) => {
         }
 
         const cal = calendarContext();
-        const h = parseInt(cal.dzis.godzina, 10);
         // Klucz pamięci podręcznej: te same dane = ta sama analiza (0 zapytań do Gemini)
         const key = live
             ? `A|live|${currentSession?.start}|${currentSession?.glownaGra || teraz.gra || ''}|${teraz.tytul || currentSession?.tytul || ''}`
-            : `A|off|${currentSession?.start}|${currentSession?.koniec}|${currentSession?.wiadomosciNaCzacie}|${kanal.followersiLacznie}|${kanal.subyLacznie}|${cal.dzis.dataISO}|${Math.floor(h / 2)}`;
+            : `A|off|${currentSession?.start}|${currentSession?.koniec}|${cal.dzis.dataISO}`;
         if (body.odswiez) cacheMain.del(key);
 
         const result = await cacheMain.memo(key, live ? TTL.analysisLive : TTL.analysisOffline, async () => {
-            const lim = LIMITS[mode], deadline = Date.now() + lim.total;
             const derived = derive(currentSession, sessionsHistory);
             const ctx = await research(body, cal, mode);           // zwykle z pamięci podręcznej
             const searchUsed = !!ctx.net;
             const prompt = buildPrompt({ ...body, live, currentSession: withClock(currentSession), sessionsHistory: sessionsHistory.map(withClock) }, cal, derived, ctx);
-            const r = await genSeq(prompt, false, lim.analysis, THINK[mode], deadline);
+            const r = await genSeq(prompt, false, PER_MODEL_MS, THINK[mode], TEXT_MODELS);
             const parsed = String(r.text).trim().startsWith('{') ? parseJson(r.text) : null;
             const text = cleanSpeech(parsed?.audioPrompt || parsed?.textResponse || r.text);
             if (!text) throw new Error('Pusta odpowiedź modelu');
