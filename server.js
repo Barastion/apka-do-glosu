@@ -276,6 +276,18 @@ function temu(thenMs, now = new Date()) {
     return `${hTxt}${m ? ` i ${m} minut` : ''} temu`;
 }
 
+// Gotowa fraza „jak długo trwał stream” (np. „4 godziny i 30 minut”) — model NIE ma sam dodawać ani przeliczać czasów.
+// Zaokrąglenie do 5 minut, żeby fraza brzmiała naturalnie.
+function durFraza(totalMin) {
+    const t = Math.max(0, Math.round((totalMin || 0) / 5) * 5);
+    if (t < 1) return 'mniej niż minutę';
+    const h = Math.floor(t / 60), m = t % 60;
+    const hTxt = h ? `${h} ${plural(h, 'godzina', 'godziny', 'godzin')}` : '';
+    const mTxt = m ? `${m} ${plural(m, 'minuta', 'minuty', 'minut')}` : '';
+    return [hTxt, mTxt].filter(Boolean).join(' i ');
+}
+const sessMin = s => s && (s.czasTrwaniaMin > 0 ? s.czasTrwaniaMin : (s.start && s.koniec ? Math.max(0, (Date.parse(s.koniec) - Date.parse(s.start)) / 6e4) : 0));
+
 function calendarContext(now = new Date()) {
     const p = warsawParts(now), dow = new Date(Date.UTC(+p.year, +p.month - 1, +p.day)).getUTCDay();
     return {
@@ -451,8 +463,8 @@ function multiDay(items) {
         a.sort((x, y) => Date.parse(x.s.start) - Date.parse(y.s.start));
         return {
             data: k, dzien: a[0].s.dzienTygodnia,
-            sesje: a.map(it => ({ od: it.s.godzinaStartu, gra: it.s.glownaGra, godzin: round(it.m.h, 1), sredniaWidzow: round(it.m.avg, 1), peak: it.m.peak, followyNaGodzine: round(it.m.folH, 2), wiadomosciNaGodzine: round(it.m.msgH, 1) })),
-            razem: { godzin: round(a.reduce((s, x) => s + x.m.h, 0), 1), noweFollowy: a.reduce((s, x) => s + (x.s.nowiFollowersi || 0), 0) }
+            sesje: a.map(it => ({ od: it.s.godzinaStartu, gra: it.s.glownaGra, godzin: round(it.m.h, 1), czasFraza: durFraza(it.m.h * 60), sredniaWidzow: round(it.m.avg, 1), peak: it.m.peak, followyNaGodzine: round(it.m.folH, 2), wiadomosciNaGodzine: round(it.m.msgH, 1) })),
+            razem: { godzin: round(a.reduce((s, x) => s + x.m.h, 0), 1), czasFraza: durFraza(a.reduce((s, x) => s + x.m.h, 0) * 60), noweFollowy: a.reduce((s, x) => s + (x.s.nowiFollowersi || 0), 0) }
         };
     });
 }
@@ -553,7 +565,8 @@ function lastSessionNote(current, cal, live, history = []) {
     if (!current) return 'Brak zapisanej historii sesji w widżecie.';
     const now = new Date(), startD = new Date(current.start);
     const endOf = s => s.koniec ? new Date(s.koniec) : new Date(new Date(s.start).getTime() + (s.czasTrwaniaMin || 0) * 6e4);
-    const slot = s => `${s.godzinaStartu || clock(new Date(s.start))}–${clock(endOf(s))}${s.glownaGra ? ` (${s.glownaGra})` : ''}`;
+    const slot = s => `${s.godzinaStartu || clock(new Date(s.start))}–${clock(endOf(s))}, trwał ${durFraza(sessMin(s))}${s.glownaGra ? ` (${s.glownaGra})` : ''}`;
+    const sumTxt = list => `Łączny czas streamowania dziś: ${durFraza(list.reduce((a, x) => a + sessMin(x), 0))}.`;
     const byStart = (a, b) => Date.parse(a.start) - Date.parse(b.start);
     const isToday = s => s && s.start && dayDiff(now, new Date(s.start)) === 0;
     const seen = new Set();
@@ -568,7 +581,7 @@ function lastSessionNote(current, cal, live, history = []) {
         const head = `Stream trwa teraz. Start: ${current.dzienTygodnia}, godz. ${current.godzinaStartu} (${temu(startD.getTime(), now)}).`;
         if (!others.length) return head;
         const last = others[others.length - 1];
-        return `${head} Dziś był już wcześniej ${others.length === 1 ? 'jeden stream' : word(others.length) + ' streamy'}: ${others.map(slot).join(', ')}. Ostatni z nich skończył się ${temu(endOf(last).getTime(), now)}.`;
+        return `${head} Dziś był już wcześniej ${others.length === 1 ? 'jeden stream' : word(others.length) + ' streamy'}: ${others.map(slot).join(', ')}. Ostatni z nich skończył się ${temu(endOf(last).getTime(), now)}. Czasy trwania podaj wyłącznie tak, jak tu zapisano.`;
     }
 
     const endD = endOf(current), dd = dayDiff(now, endD);
@@ -577,9 +590,9 @@ function lastSessionNote(current, cal, live, history = []) {
     todayList.sort(byStart);
     if (todayList.length >= 2) {
         const lastEnd = Math.max(...todayList.map(s => endOf(s).getTime()));
-        return `Dziś były już ${word(todayList.length)} streamy: ${todayList.map(slot).join(', ')}. Ostatni skończył się ${temu(lastEnd, now)}.`;
+        return `Dziś były już ${word(todayList.length)} streamy: ${todayList.map(slot).join(', ')}. ${sumTxt(todayList)} Ostatni skończył się ${temu(lastEnd, now)}. Czasy trwania i sumę podaj wyłącznie tak, jak tu zapisano — nie dodawaj ich sama.`;
     }
-    if (todayList.length === 1) return `Dziś był już stream: start ${current.godzinaStartu}, koniec ok. ${clock(endD)}, skończył się ${temu(endD.getTime(), now)}.`;
+    if (todayList.length === 1) return `Dziś był już stream: start ${current.godzinaStartu}, koniec ok. ${clock(endD)}, trwał ${durFraza(sessMin(current))}, skończył się ${temu(endD.getTime(), now)}.`;
     return `Dziś nie było jeszcze streama. Ostatni skończył się ${temu(endD.getTime(), now)} (${current.dzienTygodnia}, start ${current.godzinaStartu}, koniec ok. ${clock(endD)}).`;
 }
 
@@ -663,17 +676,17 @@ function buildPrompt(body, cal, derived, ctx) {
 
     const modeBlock = live ? `
 TRYB: STREAM TRWA (na żywo). Widzowie prawdopodobnie też Cię słyszą.
-- Skup się na bieżącej sesji na tle historii. Obowiązkowo wspomnij: aktualną liczbę widzów, średnią sesji, wiadomości na czacie i liczbę piszących, nowe followy i suby w tej sesji (jeśli są), o której zaczął się stream, dzień tygodnia, grę i tytuł. Jeśli dziś był już wcześniejszy stream, wspomnij o nim jednym zdaniem.
+- Skup się na bieżącej sesji na tle historii. Obowiązkowo wspomnij: aktualną liczbę widzów, średnią sesji, wiadomości na czacie i liczbę piszących, nowe followy i suby w tej sesji (jeśli są), o której zaczął się stream, dzień tygodnia, grę i tytuł — ale jak w audycji, a nie jak z tabeli: widzów i średnią powiedz razem w jednym zdaniu, wiadomości i piszących w drugim (zaokrąglone), followy i suby przy okazji, tytuł krótkim zwrotem. W całej wypowiedzi użyj najwyżej ok. sześciu liczb, resztę przekaż słowami („czat żyje”, „widownia rośnie”). Jeśli dziś był już wcześniejszy stream, wspomnij o nim jednym zdaniem (z czasem trwania wg gotowej frazy).
 - Z pola "aktualnie" (słupki widzów i czatu, trendy) powiedz, czy widownia i czat rosną, maleją czy są stabilne.
 - Z KONTEKSTU Z SIECI podaj, ile osób w Polsce ogląda tę grę i ilu ją streamuje (jeśli jest w kontekście), oraz największe wydarzenia dziś.
-- Styl: radiowy, lekko komentatorski, angażujący, rzeczowy. Krótkie, rytmiczne zdania.
+- Styl: jak prowadząca audycji radiowej — ciepły, żywy, lekko komentatorski, z małą historią (dzieje się to i to, bo…) zamiast listy wyników. Krótkie, rytmiczne zdania, zwroty do słuchaczy dozwolone. Liczby jako akcenty, nie jako szkielet.
 - Zakończ lekkim CTA: ${ctaTxt}. Nienachalnie, bez błagania, tym samym tonem i w tym samym stylu co cała wypowiedź; łagodność oddaj doborem słów.
 - Długość: ok. 150–180 słów (ok. minuty mówienia).` : `
 TRYB: STREAM ZAKOŃCZONY / OFFLINE.
-- Ok. 50% wypowiedzi: dzisiejsze streamy łącznie (jeśli było ich kilka) i najnowsza zakończona sesja — jak poszła, porównanie z historią (z uwzględnieniem czasu trwania), powody odchyleń.
+- Ok. 50% wypowiedzi: dzisiejsze streamy łącznie (jeśli było ich kilka; czas trwania i sumę podaj wg gotowych fraz) i najnowsza zakończona sesja — jak poszła, porównanie z historią (z uwzględnieniem czasu trwania), powody odchyleń.
 - Gdy danych o sesjach mało, skup się na danych kanału: followersi, tempo przyrostu w 30 dni, suby, daty ostatnich followów i subów.
 - Pozostałe 50%: wzorce (najlepsze dni, pory i godziny wg punktu A, gry, przyczyny), rynek polski, kalendarz, patche/premiery/wydarzenia, stosunek widzów do streamujących dla gier, w które gra.
-- Styl: analityczny, spokojny, rzeczowy. Bez CTA do widzów.
+- Styl: analityczny, spokojny, rzeczowy, ale ludzki — jak rzeczowa rozmowa z doświadczonym analitykiem, nie jak odczyt raportu. Każdy akapit to jeden wątek: wniosek, potem jedna–dwie liczby i przyczyna. W całej wypowiedzi użyj najwyżej ok. dwunastu liczb; reszta słowami. Bez CTA do widzów.
 - Długość: ok. 250–300 słów (do 2 minut mówienia).`;
 
     // Przebieg bieżącej sesji jako zwarta tabela (JSON z powtarzanymi nazwami pól kosztował ok. 2× więcej tokenów)
@@ -706,18 +719,19 @@ TRYB: STREAM ZAKOŃCZONY / OFFLINE.
 4. Prawda, bez słodzenia, ale i bez pesymizmu: szukaj plusów, wspominaj minusy. Nie zmyślaj liczb. Odróżniaj twarde dane z historii, szacunki (pola „szac_”) i hipotezy. Czego nie da się sprawdzić — powiedz wprost. Grupy z polem "uwaga" (pojedyncza sesja, tylko dwie sesje) to ciekawostka, nie wzorzec.
 5. Świeżość i początek: dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Zacznij od przedstawienia się jako analityczka kanału ${channelName} i powiedz, jaki jest dziś dzień, data i godzina. Następnie: ${note} Wspominaj tylko wydarzenia z kontekstu z sieci (dzisiejsze, przyszłe lub z ostatnich 7 dni); niepotwierdzonego nie wspominaj.
 6. Dopasuj analizę do polskich widzów i polskiego Twitcha.
-7. Czas, który upłynął od streama, podawaj wyłącznie gotową frazą z danych (np. „25 minut temu”, „3 godziny i 45 minut temu”). Nie przeliczaj go sama i nie zaokrąglaj do godzin.
+7. Czas, który upłynął od streama, podawaj wyłącznie gotową frazą z danych (np. „25 minut temu”, „3 godziny i 45 minut temu”). Nie przeliczaj go sama i nie zaokrąglaj do godzin. To samo dotyczy CZASU TRWANIA streamów i ich sumy z jednego dnia: podawaj wyłącznie gotowe frazy z danych („czasFraza”, „Łączny czas streamowania dziś”, „trwał …”). Nigdy nie dodawaj ani nie odejmuj godzin i minut samodzielnie, a gdy gotowej frazy brak — nie podawaj sumy.
 8. Dwa streamy lub więcej tego samego dnia (pole "dniZWieluStreamami"): oceń najpierw dzień łącznie (czas, widzowie, followy), potem sesje osobno i porównaj np. poranny z wieczornym wartościami na godzinę — to cenne dane o najlepszych momentach. Różnicę między nimi tłumacz porą i przerwą, nie traktuj jej jako samodzielnego wniosku.
 9. Pora i konkurencja: piątkowy wieczór, sobota, niedziela i święta to nie tylko więcej oglądających, ale też więcej streamujących naraz, bo jedno idzie w parze z drugim. Zakładaj to zawsze, także gdy brakuje danych z sieci. Uwzględniaj to w szukaniu przyczyn jako prawdopodobną hipotezę, obok innych możliwych przyczyn.
+10. Mów o liczbach z sensem, dla słuchacza, który słyszy tekst raz i nie może wrócić do poprzedniego zdania. Najpierw wniosek własnymi słowami, potem liczba, która go potwierdza („widownia była wyraźnie większa niż zwykle, średnio o około dwadzieścia procent”). Każda liczba ma od razu mieć znaczenie: powiedz, co oznacza, a nie tylko ją podaj. Liczby i procenty są mile widziane, ale oszczędnie i tam, gdzie coś pokazują: nie w każdym zdaniu, najwyżej jedna–dwie w zdaniu i nigdy kilka procentów pod rząd. Zaokrąglaj jak w rozmowie („prawie czterdzieści osób”, „co trzeci”); dokładnie podawaj tylko czas trwania i godziny. Nie czytaj nazw pól, indeksów ani współczynników — zamień je na zwykłe słowa. Z danych wybierz to, co najważniejsze, i pomiń resztę.
 
 ═══ CO ANALIZOWAĆ ═══
-A. Najlepsze momenty (pole "najlepszeMomenty", nie licz w pamięci): wskaż maks. 3 najlepsze dni tygodnia, maks. 2 najlepsze pory dnia (rano, południe, popołudnie, wieczór, noc) oraz godziny warte uwagi ("mocneOkna" = najmocniejsze okna półgodzinne, "mocnePrzedzialy" = ciągłe przedziały godzin z widownią wyraźnie powyżej średniej streama, także w środku sesji; podawaj przedziały, np. „od dwudziestej do dwudziestej drugiej trzydzieści”). Nie wymieniaj więcej. Zawsze poprzyj to liczbami z danych (widzowie, followy na godzinę, wiadomości, indeks); bez danych niczego nie wskazuj. Tylko wspomnij, że to mocne dni i godziny według danych — bez sugerowania, kiedy warto być online. Dni i godziny to dwa OSOBNE wnioski: podaj je osobno („mocne dni”, „mocne godziny”) i nigdy nie łącz ich w „wtorek o dwudziestej” — dane nie sprawdzają tej kombinacji. Gdy widownia jest mała, a czatIdx, followyIdx, wiadomosciNaWidzaNaGodzine lub followyNa100GodzinOgladania wysokie, powiedz, że to mała, ale zaangażowana widownia. Godziny liczone są z wielu zapisanych sesji ("sesjiZPrzebiegiem") — możesz powiedzieć, z ilu. Dołącz "followyMomenty", jeśli pasuje do tych godzin. "odStartuH" mówi, ile godzin po starcie streama wypadała dana godzina. Przy małej próbie ("wiarygodnosc") mów ostrożnie („na razie wygląda na…”), ale nadal wskaż najlepsze. Szukaj PRZYCZYN (początek weekendu, święto, wakacje/ferie, pora roku, wydarzenia z kontekstu, ruch i konkurencja wg zasady 9).
+A. Najlepsze momenty (pole "najlepszeMomenty", nie licz w pamięci): wskaż maks. 3 najlepsze dni tygodnia, maks. 2 najlepsze pory dnia (rano, południe, popołudnie, wieczór, noc) oraz godziny warte uwagi ("mocneOkna" = najmocniejsze okna półgodzinne, "mocnePrzedzialy" = ciągłe przedziały godzin z widownią wyraźnie powyżej średniej streama, także w środku sesji; podawaj przedziały, np. „od dwudziestej do dwudziestej drugiej trzydzieści”). Nie wymieniaj więcej. Poprzyj to jedną lub dwiema najważniejszymi liczbami z danych, zaokrąglonymi i podanymi po ludzku (nie czytaj indeksów); bez danych niczego nie wskazuj. Tylko wspomnij, że to mocne dni i godziny według danych — bez sugerowania, kiedy warto być online. Dni i godziny to dwa OSOBNE wnioski: podaj je osobno („mocne dni”, „mocne godziny”) i nigdy nie łącz ich w „wtorek o dwudziestej” — dane nie sprawdzają tej kombinacji. Gdy widownia jest mała, a czatIdx, followyIdx, wiadomosciNaWidzaNaGodzine lub followyNa100GodzinOgladania wysokie, powiedz, że to mała, ale zaangażowana widownia. Godziny liczone są z wielu zapisanych sesji ("sesjiZPrzebiegiem") — możesz powiedzieć, z ilu. Dołącz "followyMomenty", jeśli pasuje do tych godzin. "odStartuH" mówi, ile godzin po starcie streama wypadała dana godzina. Przy małej próbie ("wiarygodnosc") mów ostrożnie („na razie wygląda na…”), ale nadal wskaż najlepsze. Szukaj PRZYCZYN (początek weekendu, święto, wakacje/ferie, pora roku, wydarzenia z kontekstu, ruch i konkurencja wg zasady 9).
 A2. Wzorce WEWNĄTRZ streama: w tabeli PRZEBIEG NAJNOWSZEJ SESJI (każda linia ma godzinę) i w słupkach z "aktualnie" znajdź wzrosty i spadki widowni i czatu, podaj godzinę i prawdopodobną przyczynę. Pierwszą godzinę streama („rozped”) traktuj jako rozpęd: niższa widownia na początku jest normalna i nie jest słabością, ale dane z niej są cenne.
 B. Gry: nowsze mają większą wagę (policzona). Wykorzystaj kontekst o oglądalności, stosunku widzów do streamujących, patchach i eventach.
 C. Tytuł i gra a wyniki: przy „DROP”/„drops” w tytule sprawdź, czy wzrost widowni przełożył się na piszących. Widzów więcej, a czat bez zmian = widzowie głównie „po nagrody”; rosną oba = stream faktycznie trzyma.
 D. Korelacje i rajdy: więcej widzów + więcej wiadomości = dobry znak; mało widzów, ale obecnych długo = stabilna publiczność; mało widzów i pisze ta sama grupa (wysoki udział czatujących) = własne grono. Wskaż, która sytuacja wygląda na prawdziwą. "skokiWidzow" = nagły wzrost z szybkim odpływem: powiedz, że to prawdopodobnie rajd lub hosting (hipoteza) i jak wygląda widownia „bazowa” bez skoku. Bez nicków.
 F. Czas trwania i przyczyny: nie porównuj sesji 1:1 — używaj wartości na godzinę z "porownanieNajnowszejSesji" i wspominaj o różnicy długości. Zawsze szukaj PRZYCZYN odchyleń, nie samego „o 5% więcej niż zwykle”.
-G0. Kiedy wpadają followy (pole "followyMomenty", ostatnie 30 dni, czas polski): "naGodzineStreamu" to followy w przeliczeniu na godzinę streamowania (najlepsze dni, pory, godziny), "najwiecejOgolem" to kiedy wpada ich najwięcej w ogóle, także poza streamem. Wskaż najlepsze (maks. 3 dni, 2 pory, 3 godziny) z liczbami i prawdopodobnymi przyczynami. Przy małej próbie (pole "probka", poniżej 15 followów) powiedz, że to za mało danych na wnioski; nie przesadzaj ze znaczeniem pojedynczych liczb. Dane obejmują dokładnie ostatnie 30 dni — nigdy nie mów o 60 dniach.
+G0. Kiedy wpadają followy (pole "followyMomenty", ostatnie 30 dni, czas polski): "naGodzineStreamu" to followy w przeliczeniu na godzinę streamowania (najlepsze dni, pory, godziny), "najwiecejOgolem" to kiedy wpada ich najwięcej w ogóle, także poza streamem. Wskaż najlepsze (maks. 3 dni, 2 pory, 3 godziny) z jedną–dwiema liczbami i prawdopodobnymi przyczynami. Przy małej próbie (pole "probka", poniżej 15 followów) powiedz, że to za mało danych na wnioski; nie przesadzaj ze znaczeniem pojedynczych liczb. Dane obejmują dokładnie ostatnie 30 dni — nigdy nie mów o 60 dniach.
 G. Tempo rozwoju: followersi w 30 dni i wzrost procentowy, saldo po unfollowach, suby (nowe i wygasłe), data ostatniego followa i suba. Nazwij dobry okres, jeśli rosną. Zaznacz, że część danych subów jest przybliżona.
 ${modeBlock}
 
@@ -742,7 +756,7 @@ WYLICZENIA SERWERA (średnie ważone, normalizacja na godzinę, porównania %):
 ${J(derived)}
 
 ═══ FORMAT ODPOWIEDZI ═══
-Zwróć WYŁĄCZNIE gotowy tekst wypowiedzi do przeczytania na głos po polsku — czysty tekst, bez markdownu, wypunktowań, symboli, emoji, nagłówków, JSON-a i adresów stron. Krótkie zdania; liczby, godziny i jednostki zapisane słownie, tak jak się je mówi („dwadzieścia procent”, „osiemnasta trzydzieści”), bez skrótów i symboli. Zachowaj długość z sekcji TRYB.`;
+Zwróć WYŁĄCZNIE gotowy tekst wypowiedzi do przeczytania na głos po polsku — czysty tekst, bez markdownu, wypunktowań, symboli, emoji, nagłówków, JSON-a i adresów stron. Krótkie zdania; liczby, godziny i jednostki zapisane słownie, tak jak się je mówi („dwadzieścia procent”, „osiemnasta trzydzieści”), bez skrótów i symboli. Pamiętaj o zasadzie 10: mniej liczb, więcej sensu. Zachowaj długość z sekcji TRYB.`;
 }
 
 // ═══════════════ GŁOS (TTS) ═══════════════
@@ -870,6 +884,7 @@ app.post('/api/analyze', async (req, res) => {
     try {
         const body = req.body || {};
         const { sessionsHistory = [], currentSession = null, channelName = 'Dolaricious', noData = false, kanal = {}, teraz = {} } = body;
+        const PROMPT_V = 'v2';   // zmieniaj po edycji promptu, żeby stare analizy z pamięci podręcznej nie wracały
         const live = body.tryb === 'live' || (body.tryb == null && !!currentSession?.trwaJeszcze);
         const mode = live ? 'live' : 'offline';
 
@@ -881,8 +896,8 @@ app.post('/api/analyze', async (req, res) => {
         const cal = calendarContext();
         // Klucz pamięci podręcznej: te same dane = ta sama analiza (0 zapytań do Gemini)
         const key = live
-            ? `A|live|${currentSession?.start}|${currentSession?.glownaGra || teraz.gra || ''}|${teraz.tytul || currentSession?.tytul || ''}`
-            : `A|off|${currentSession?.start}|${currentSession?.koniec}|${cal.dzis.dataISO}`;
+            ? `A|${PROMPT_V}|live|${currentSession?.start}|${currentSession?.glownaGra || teraz.gra || ''}|${teraz.tytul || currentSession?.tytul || ''}`
+            : `A|${PROMPT_V}|off|${currentSession?.start}|${currentSession?.koniec}|${cal.dzis.dataISO}`;
         if (body.odswiez) cacheMain.del(key);
 
         const result = await cacheMain.memo(key, live ? TTL.analysisLive : TTL.analysisOffline, async () => {
