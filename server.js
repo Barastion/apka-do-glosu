@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const { GoogleGenAI } = require('@google/genai');
 
 const app = express();
@@ -13,14 +14,25 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const TEXT_MODEL = process.env.TEXT_MODEL || 'gemini-3.8-flash';
 const TTS_MODELS = [process.env.TTS_MODEL || 'gemini-3.8-flash-tts', 'gemini-3.8-flash-lite-tts'];
 const TTS_VOICE = process.env.TTS_VOICE || 'Kore';
+// Modele tekstowe są próbowane PO KOLEI (zapasowy tylko gdy główny zawiedzie) — nie równolegle, bo to podwajało zużycie limitu
 const TEXT_MODELS = [...new Set([TEXT_MODEL, process.env.TEXT_MODEL_FALLBACK || 'gemini-3.7-flash'])];
 
-// Poziom „myślenia”: na żywo szybko, offline głębiej (zmienne środowiskowe THINK_LIVE / THINK_OFFLINE)
+// Poziom „myślenia” (zmienne środowiskowe THINK_LIVE / THINK_OFFLINE). Liczby są policzone w kodzie, więc 'low' w zupełności wystarcza na żywo.
 const THINK = { live: process.env.THINK_LIVE || 'low', offline: process.env.THINK_OFFLINE || 'medium' };
-// Limity czasu analizy: na żywo ok. minuty, offline maks. ok. 2 minuty (z zapasem na wyszukiwanie)
+
+// Limity czasu (ms): badanie sieci (równolegle), analiza końcowa, całość
 const LIMITS = {
-    live:    { search: 50000, fallback: 25000 },
-    offline: { search: 90000, fallback: 25000 }
+    live:    { research: 30000, analysis: 35000, total: 72000 },
+    offline: { research: 45000, analysis: 55000, total: 115000 }
+};
+
+// Czas życia pamięci podręcznej
+const TTL = {
+    analysisLive: 4 * 60e3,       // dwa kliknięcia w ciągu 4 min = ta sama analiza (0 zapytań)
+    analysisOffline: 2 * 3600e3,  // offline dane się nie zmieniają, więc analiza ważna 2 h (lub do zmiany danych)
+    calendar: 10 * 3600e3,        // święta/wydarzenia sprawdzane w sieci RAZ NA DZIEŃ
+    games: 3 * 3600e3,            // rynek gier (widzowie/streamujący, patche) RAZ NA 3 GODZINY
+    audio: 6 * 3600e3
 };
 
 // Style głosu: na żywo — radiowy, lekko komentatorski; offline — analityczny (głos nadal kobiecy: Kore)
@@ -30,11 +42,34 @@ const TTS_STYLES = {
 };
 
 const withTimeout = (p, ms, label) => Promise.race([
-    p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: przekroczono limit ${ms / 1000}s`)), ms))
+    p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: przekroczono limit ${Math.round(ms / 1000)}s`)), ms))
 ]);
 
-// Wywołanie modelu tekstowego: najpierw z zadanym poziomem „myślenia”, a gdyby model odrzucił ten parametr — bez niego
-async function gen(prompt, search, ms, model = TEXT_MODEL, think = 'low') {
+// ═══════════════ PAMIĘĆ PODRĘCZNA (przechowuje też obietnice w toku, więc równoległe kliknięcia nie dublują zapytań) ═══════════════
+function makeCache(max) {
+    const m = new Map();
+    return {
+        del: k => m.delete(k),
+        async memo(k, ttl, fn) {
+            const e = m.get(k);
+            if (e && e.exp > Date.now()) return e.val;
+            m.delete(k);
+            const p = fn();
+            m.set(k, { exp: Date.now() + ttl, val: p });
+            while (m.size > max) m.delete(m.keys().next().value);
+            try { return await p; } catch (err) { m.delete(k); throw err; }
+        }
+    };
+}
+const cacheMain = makeCache(60);
+const cacheAudio = makeCache(10);
+
+// Zwarty JSON dla promptu: bez wcięć oraz bez null / pustych napisów / pustych tablic (mniej tokenów wejściowych)
+const J = o => JSON.stringify(o, (k, v) => (v === null || v === '' || (Array.isArray(v) && !v.length)) ? undefined : v);
+
+// ═══════════════ WYWOŁANIA MODELU ═══════════════
+// Klasyczne generateContent (plan B dla Interactions API)
+async function gen(prompt, search, ms, model, think) {
     const base = search ? { tools: [{ googleSearch: {} }] } : {};
     const tries = [{ ...base, thinkingConfig: { thinkingLevel: think } }, base];
     let last = null;
@@ -43,21 +78,19 @@ async function gen(prompt, search, ms, model = TEXT_MODEL, think = 'low') {
             return await withTimeout(ai.models.generateContent({ model, contents: prompt, config }), ms, `Analiza (${model})`);
         } catch (e) {
             last = e;
-            if (/przekroczono limit/.test(e.message)) throw e; // timeout → nie ponawiamy tu, robi to wywołujący
+            if (/przekroczono limit/.test(e.message)) throw e;
             console.error('Próba generowania nieudana:', e.message);
         }
     }
     throw last;
 }
 
-// Zbiera adresy źródeł z odpowiedzi Interactions API (adnotacje url_citation)
 function collectSources(i) {
     const out = new Set();
     for (const st of i?.steps || []) for (const c of st.content || []) for (const a of c.annotations || []) if (a?.url) out.add(a.url);
     return [...out];
 }
 
-// Jedno podejście do modelu: najpierw Interactions API (zalecane przez Google), potem klasyczne generateContent
 async function genOne(prompt, search, ms, model, think) {
     try {
         const req = { model, input: prompt, generation_config: { thinking_level: think } };
@@ -74,17 +107,20 @@ async function genOne(prompt, search, ms, model, think) {
     return { text: r.text, model, via: 'generateContent', sources: chunks.map(c => c.web?.uri).filter(Boolean) };
 }
 
-// Wszystkie modele naraz — bierzemy pierwszą udaną odpowiedź (gdy jeden jest przeciążony, drugi ratuje sytuację)
-async function genRace(prompt, search, ms, think) {
+// Modele PO KOLEI: zapasowy dopiero, gdy główny zawiódł i zostało dość czasu do końcowego terminu
+async function genSeq(prompt, search, ms, think, deadline) {
     const t0 = Date.now();
-    try {
-        const r = await Promise.any(TEXT_MODELS.map(m => genOne(prompt, search, ms, m, think)));
-        console.log(`Analiza OK (${r.model}, ${r.via}${search ? ', z wyszukiwaniem' : ''}, think=${think}): ${Date.now() - t0} ms`);
-        return r;
-    } catch (e) {
-        const msgs = (e.errors || [e]).map(x => x.message).join(' | ');
-        throw new Error(msgs);
+    const errs = [];
+    for (const m of TEXT_MODELS) {
+        const left = deadline - Date.now();
+        if (left < 8000) { errs.push(`${m}: brak czasu na kolejną próbę`); break; }
+        try {
+            const r = await genOne(prompt, search, Math.min(ms, left), m, think);
+            console.log(`Model OK (${r.model}, ${r.via}${search ? ', z wyszukiwaniem' : ''}, think=${think}): ${Date.now() - t0} ms`);
+            return r;
+        } catch (e) { errs.push(`${m}: ${e.message}`); console.error('Model zawiódł:', e.message); }
     }
+    throw new Error(errs.join(' | '));
 }
 
 function parseJson(t) {
@@ -92,19 +128,22 @@ function parseJson(t) {
     try { return JSON.parse(c); } catch (e) {}
     const m = c.match(/\{[\s\S]*\}/);
     if (m) { try { return JSON.parse(m[0]); } catch (e) {} }
-    const ma = c.match(/"audioPrompt"\s*:\s*"([\s\S]*?)"\s*[,}]/), mt = c.match(/"textResponse"\s*:\s*"([\s\S]*?)"\s*[,}]/);
-    if (ma || mt) { const un = x => x.replace(/\\n/g, ' ').replace(/\\"/g, '"'); return { audioPrompt: ma ? un(ma[1]) : undefined, textResponse: mt ? un(mt[1]) : undefined }; }
     return null;
 }
 
-// ═══════════════ DATA I CZAS (jedyne, co liczy serwer; święta/wydarzenia sprawdza sam model w sieci) ═══════════════
+// Czysty tekst pod syntezator mowy: bez markdownu, przypisów, adresów
+const cleanSpeech = t => String(t || '')
+    .replace(/```[a-z]*/gi, '').replace(/\[\d+(?:\s*,\s*\d+)*\]/g, '').replace(/https?:\/\/\S+/g, '')
+    .replace(/[*#`>]+/g, '').replace(/^\s*[-•]\s+/gm, '').replace(/\s*\n+\s*/g, ' ').replace(/\s{2,}/g, ' ').trim();
+
+// ═══════════════ DATA I CZAS ═══════════════
 const TZ = 'Europe/Warsaw';
 function warsawParts(d) {
     const f = new Intl.DateTimeFormat('pl-PL', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long', hour: '2-digit', minute: '2-digit', hour12: false });
     return Object.fromEntries(f.formatToParts(d).map(x => [x.type, x.value]));
 }
 const warsawYmd = d => { const p = warsawParts(d); return `${p.year}-${p.month}-${p.day}`; };
-const dayDiff = (a, b) => Math.round((Date.parse(warsawYmd(a) + 'T00:00:00Z') - Date.parse(warsawYmd(b) + 'T00:00:00Z')) / 864e5); // a − b w dniach (czas warszawski)
+const dayDiff = (a, b) => Math.round((Date.parse(warsawYmd(a) + 'T00:00:00Z') - Date.parse(warsawYmd(b) + 'T00:00:00Z')) / 864e5);
 const clock = d => new Intl.DateTimeFormat('pl-PL', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
 
 function calendarContext(now = new Date()) {
@@ -117,66 +156,63 @@ function calendarContext(now = new Date()) {
     };
 }
 
-// Dopisuje do osi czasu sesji godzinę zegarową (minuty od startu → HH:MM), żeby model widział, o której rosła i spadała widownia
 function withClock(s) {
     if (!s || !Array.isArray(s.przebieg) || !s.start) return s;
     const t0 = Date.parse(s.start);
     return { ...s, przebieg: s.przebieg.map(x => ({ godzina: clock(new Date(t0 + (x.min || 0) * 6e4)), ...x })) };
 }
 
-// ═══════════════ WYLICZENIA STATYSTYCZNE (robimy w kodzie, model tylko interpretuje) ═══════════════
+// ═══════════════ WYLICZENIA STATYSTYCZNE (w kodzie, model tylko interpretuje) ═══════════════
 const round = (n, d = 0) => Number.isFinite(n) ? Math.round(n * 10 ** d) / 10 ** d : null;
 const pct = (a, b) => (Number.isFinite(a) && Number.isFinite(b) && b > 0) ? Math.round((a - b) / b * 100) : null;
 const band = hh => hh >= 6 && hh < 12 ? 'rano (6–11)' : hh >= 12 && hh < 17 ? 'popołudnie (12–16)' : hh >= 17 && hh < 22 ? 'wieczór (17–21)' : 'noc (22–5)';
 
 function sessionMetrics(s) {
     const h = Math.max(0.05, (s.czasTrwaniaMin || 0) / 60);
+    const subs = s.noweSuby ?? s.noweSubskrypcje ?? 0;
     return {
-        h,
-        avg: s.sredniaWidzow || 0,
-        peak: s.peakWidzow || 0,
-        msgH: (s.wiadomosciNaCzacie || 0) / h,
-        folH: (s.nowiFollowersi || 0) / h,
-        subH: (s.noweSuby || 0) / h,
+        h, avg: s.sredniaWidzow || 0, peak: s.peakWidzow || 0,
+        msgH: (s.wiadomosciNaCzacie || 0) / h, folH: (s.nowiFollowersi || 0) / h, subH: subs / h,
         chatShare: s.szac_unikalniWidzowie > 0 ? (s.unikalniCzatujacy || 0) / s.szac_unikalniWidzowie : null,
         msgPerViewerHour: (s.sredniaWidzow > 0) ? (s.wiadomosciNaCzacie || 0) / (s.sredniaWidzow * h) : null
     };
 }
-function wavg(items, key) { // średnia ważona (wagi malejące dla starszych sesji)
+function wavg(items, key) {
     let ws = 0, vs = 0;
     for (const it of items) { const v = it.m[key]; if (v == null || !Number.isFinite(v)) continue; ws += it.w; vs += v * it.w; }
     return ws ? vs / ws : null;
 }
-function groupBy(list, keyFn) {
+function groupBy(list, keyFn, top = 8) {
     const map = {};
     list.forEach(it => { const k = keyFn(it); if (!k) return; (map[k] = map[k] || []).push(it); });
     return Object.entries(map).map(([k, arr]) => ({
         klucz: k, liczbaSesji: arr.length, lacznieGodzin: round(arr.reduce((a, x) => a + x.m.h, 0), 1),
         sredniaWidzow_wazona: round(wavg(arr, 'avg'), 1), sredniPeak_wazony: round(wavg(arr, 'peak'), 1),
         wiadomosciNaGodzine_wazone: round(wavg(arr, 'msgH'), 1), nowiFollowersiNaGodzine_wazone: round(wavg(arr, 'folH'), 2),
-        noweSubyNaGodzine_wazone: round(wavg(arr, 'subH'), 2), wagaOstatnichSesji: round(arr.reduce((a, x) => a + x.w, 0), 2)
-    })).sort((a, b) => (b.sredniaWidzow_wazona || 0) - (a.sredniaWidzow_wazona || 0));
+        noweSubyNaGodzine_wazone: round(wavg(arr, 'subH'), 2)
+    })).sort((a, b) => (b.sredniaWidzow_wazona || 0) - (a.sredniaWidzow_wazona || 0)).slice(0, top);
 }
 
 function derive(current, history) {
     const all = [...(current ? [current] : []), ...(history || [])].filter(s => s && s.czasTrwaniaMin > 0 && s.start);
-    // wagi: najnowsza sesja = 1, każda starsza × 0.82 — ostatnie gry i terminy liczą się wyraźnie bardziej
+    // wagi: najnowsza sesja = 1, każda starsza × 0.82
     const items = all.map((s, i) => ({ s, m: sessionMetrics(s), w: Math.pow(0.82, i) }));
     const histItems = items.filter(it => it.s !== current);
+    const hourOf = s => parseInt(String(s.godzinaStartu || '').slice(0, 2), 10);
     const out = { liczbaSesjiWHistorii: histItems.length };
     out.wedlugGier = groupBy(items, it => it.s.glownaGra);
     out.wedlugDniTygodnia = groupBy(items, it => it.s.dzienTygodnia);
-    out.wedlugPorStartu = groupBy(items, it => { const hh = parseInt(String(it.s.godzinaStartu || '').slice(0, 2), 10); return Number.isFinite(hh) ? band(hh) : null; });
-    out.wedlugGodzinyStartu = groupBy(items, it => { const hh = parseInt(String(it.s.godzinaStartu || '').slice(0, 2), 10); return Number.isFinite(hh) ? String(hh).padStart(2, '0') + ':00' : null; });
+    out.wedlugPorStartu = groupBy(items, it => Number.isFinite(hourOf(it.s)) ? band(hourOf(it.s)) : null);
+    out.wedlugGodzinyStartu = groupBy(items, it => Number.isFinite(hourOf(it.s)) ? String(hourOf(it.s)).padStart(2, '0') + ':00' : null);
     if (current && histItems.length) {
         const cm = sessionMetrics(current);
         const base = k => wavg(histItems, k);
-        const mk = (arr) => arr.length ? {
+        const mk = arr => arr.length ? {
             sredniaWidzow: round(wavg(arr, 'avg'), 1), peak: round(wavg(arr, 'peak'), 1), wiadomosciNaGodzine: round(wavg(arr, 'msgH'), 1),
             nowiFollowersiNaGodzine: round(wavg(arr, 'folH'), 2), liczbaSesjiWBazie: arr.length
         } : null;
         out.porownanieNajnowszejSesji = {
-            uwaga: 'Porównanie po znormalizowaniu do godziny streama (wiadomości i followersi na godzinę); średnia widzów i peak są porównywane bezpośrednio, ale pamiętaj o różnicy długości sesji.',
+            uwaga: 'Wiadomości i followersi porównane na godzinę streama; średnia widzów i peak bezpośrednio — pamiętaj o różnicy długości sesji.',
             czasTrwaniaNajnowszejH: round(cm.h, 2), sredniCzasTrwaniaHistoriiH: round(base('h'), 2),
             odchylenieProcent_wzgledemWazonejHistorii: {
                 sredniaWidzow: pct(cm.avg, base('avg')), peak: pct(cm.peak, base('peak')),
@@ -185,7 +221,7 @@ function derive(current, history) {
             historiaWazona: mk(histItems),
             tenSamDzienTygodnia: mk(histItems.filter(it => it.s.dzienTygodnia === current.dzienTygodnia)),
             taSamaGra: current.glownaGra ? mk(histItems.filter(it => it.s.glownaGra === current.glownaGra)) : null,
-            takaSamaPoraStartu: mk(histItems.filter(it => band(parseInt(String(it.s.godzinaStartu || '0').slice(0, 2), 10)) === band(parseInt(String(current.godzinaStartu || '0').slice(0, 2), 10)))),
+            takaSamaPoraStartu: mk(histItems.filter(it => band(hourOf(it.s) || 0) === band(hourOf(current) || 0))),
             udzialCzatujacychWSzacowanychUnikalnych: { najnowsza: round(cm.chatShare, 2), historia: round(base('chatShare'), 2) },
             wiadomosciNaWidzaNaGodzine: { najnowsza: round(cm.msgPerViewerHour, 2), historia: round(base('msgPerViewerHour'), 2) }
         };
@@ -207,8 +243,52 @@ function lastSessionNote(current, cal, live) {
     return `Dziś nie było jeszcze streama. Ostatni miał miejsce ${dd === 1 ? 'wczoraj' : dd + ' dni temu'} (${current.dzienTygodnia}, start ${current.godzinaStartu}, koniec ok. ${end}).`;
 }
 
-// ═══════════════ PROMPT ═══════════════
-function buildPrompt(body, cal, derived) {
+// ═══════════════ BADANIE SIECI (z pamięcią podręczną) ═══════════════
+// Zamiast wyszukiwać w sieci przy KAŻDYM kliknięciu, robimy to osobno i zapamiętujemy:
+//  • kalendarz/święta/wydarzenia — raz na dzień (model sam sprawdza w sieci, żadnych wgranych dat, działa w każdym roku),
+//  • rynek gier — raz na ~3 godziny dla danego zestawu gier.
+// Analiza końcowa nie używa już wyszukiwarki, więc jest szybka i tania.
+function calendarResearchPrompt(cal) {
+    return `Dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Sprawdź w sieci i podaj WYŁĄCZNIE fakty potwierdzone dla DZISIAJ i najbliższych 7 dni w Polsce:
+1) święta państwowe i kościelne, dni wolne od pracy, długi weekend lub „most”;
+2) okres: wakacje, ferie (zimowe z podziałem na województwa, jeśli trwają), okres przedświąteczny, matury i egzaminy, pora roku;
+3) wydarzenia odciągające Polaków od Twitcha lub ściągające na niego: mecze reprezentacji Polski, duże gale freak-fightowe, finały turniejów e-sportowych (np. IEM Katowice), ważne premiery i największe wydarzenia na Twitchu.
+Wydarzenia z przeszłości tylko z ostatnich 7 dni i tylko jeśli realnie wpływają na Twitcha. Użyj maksymalnie 2–3 wyszukiwań. Odpowiedz krótkimi punktami (maks. 120 słów), z datami. Bez nazw firm, portali i serwisów (wyjątek: gry, studia, wydawcy, Twitch) i bez linków. Jeśli czegoś nie potwierdzisz — pomiń to; jeśli nic nie ma, napisz „Brak potwierdzonych wydarzeń”. Na początku w jednym zdaniu: czy dziś to dzień roboczy, weekend lub wolny od pracy.`;
+}
+function gamesResearchPrompt(cal, games) {
+    return `Dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Gry streamowane ostatnio na polskim kanale Twitch (od najświeższej): ${games.join('; ')}.
+Sprawdź w sieci dla każdej z nich: (a) oglądalność w Polsce i miejsce na tle czołowych gier polskiego Twitcha; (b) stosunek liczby widzów do liczby streamujących i w jakie dni/godziny bywa najkorzystniejszy (tylko informacja); (c) patche, aktualizacje, premiery, dropy i eventy dziejące się DZIŚ lub w przyszłości (podaj kiedy) albo z ostatnich 7 dni, jeśli realnie wpływają na Twitcha. Dodatkowo: jaka inna duża gra lub wydarzenie na Twitchu ściąga teraz widzów w Polsce.
+Użyj maksymalnie 3 wyszukiwań. Odpowiedz krótkimi punktami (maks. 170 słów), jeden blok na grę. Nie zmyślaj liczb — jeśli czegoś nie da się sprawdzić, napisz to wprost. Bez nazw firm, portali i serwisów (wyjątek: gry, studia, wydawcy, Twitch) i bez linków.`;
+}
+function pickGames(body) {
+    const seen = [], add = g => { if (g && typeof g === 'string' && !seen.some(x => x.toLowerCase() === g.toLowerCase())) seen.push(g.trim()); };
+    const cur = body.currentSession;
+    add(body.teraz?.gra); add(cur?.glownaGra); (cur?.gry || []).slice(0, 2).forEach(x => add(x.nazwa));
+    (body.sessionsHistory || []).slice(0, 4).forEach(s => add(s.glownaGra));
+    return seen.slice(0, 3);
+}
+
+async function research(body, cal, mode) {
+    const lim = LIMITS[mode], think = 'low';
+    const date = cal.dzis.dataISO, block = Math.floor(parseInt(cal.dzis.godzina, 10) / 3);
+    const games = pickGames(body);
+    const job = (key, ttl, prompt) => cacheMain.memo(key, ttl, () => genSeq(prompt, true, lim.research, think, Date.now() + lim.research + 4000));
+    const [c, g] = await Promise.allSettled([
+        job(`cal|${date}`, TTL.calendar, calendarResearchPrompt(cal)),
+        games.length ? job(`games|${date}|${block}|${games.map(x => x.toLowerCase()).sort().join('+')}`, TTL.games, gamesResearchPrompt(cal, games)) : Promise.reject(new Error('brak gier'))
+    ]);
+    const val = r => r.status === 'fulfilled' ? r.value : null;
+    [c, g].forEach((r, i) => { if (r.status === 'rejected' && !(i === 1 && !games.length)) console.error('Badanie sieci nieudane:', r.reason?.message); });
+    return {
+        calendar: val(c)?.text?.trim() || null,
+        games: val(g)?.text?.trim() || null,
+        gamesList: games,
+        sources: [...new Set([...(val(c)?.sources || []), ...(val(g)?.sources || [])])]
+    };
+}
+
+// ═══════════════ PROMPT ANALIZY ═══════════════
+function buildPrompt(body, cal, derived, ctx) {
     const { channelName = 'Dolaricious', sessionsHistory = [], currentSession = null, live = false, kanal = {}, teraz = {}, wariantCTA = 'obserwowanie' } = body;
     const note = lastSessionNote(currentSession, cal, live);
     const ctaTxt = wariantCTA === 'obserwowanie_i_suby'
@@ -216,74 +296,71 @@ function buildPrompt(body, cal, derived) {
         : 'subtelnie zachęć widzów wyłącznie do zaobserwowania kanału (jedno miękkie zdanie, bez wzmianki o subskrypcji)';
 
     const modeBlock = live ? `
-TRYB: STREAM TRWA (analiza „na żywo”). Prawdopodobnie widzowie też Cię słyszą.
-- Skup się na bieżącej sesji i oceniaj bieżące wydarzenia na tle historii.
-- Obowiązkowo wspomnij: aktualną liczbę widzów, średnią sesji, liczbę wiadomości na czacie i liczbę piszących, nowe followy i suby w tej sesji (jeśli są), o której zaczął się stream, dzień tygodnia, w jaką grę i pod jakim tytułem trwa transmisja.
-- Odczytaj z słupków (pole "aktualnie": słupki widzów i czatu oraz ich trendy), czy trend widowni i czatu jest rosnący, malejący czy stabilny.
-- Sprawdź w sieci, ile osób w Polsce ogląda teraz tę grę i ilu streamerów ją streamuje (jeśli się da), oraz największe wydarzenia na Twitchu dziś.
-- Styl: radiowy, lekko komentatorski, angażujący widzów, kobiecy, ale rzeczowy. Krótkie, rytmiczne zdania.
-- Zakończ lekkim CTA: ${ctaTxt}. Ma być nienachalne, naturalne i bez błagania.
-- Długość: tekst do wypowiedzenia ok. 150–180 słów (ok. minuty mówienia). Wyszukaj w sieci maksymalnie 4–5 razy (zaplanuj zapytania tak, by jedno obejmowało kalendarz i wydarzenia, a pozostałe grę i Twitcha), żeby zmieścić się w czasie.` : `
+TRYB: STREAM TRWA (na żywo). Widzowie prawdopodobnie też Cię słyszą.
+- Skup się na bieżącej sesji na tle historii. Obowiązkowo wspomnij: aktualną liczbę widzów, średnią sesji, wiadomości na czacie i liczbę piszących, nowe followy i suby w tej sesji (jeśli są), o której zaczął się stream, dzień tygodnia, grę i tytuł.
+- Z pola "aktualnie" (słupki widzów i czatu, trendy) powiedz, czy widownia i czat rosną, maleją czy są stabilne.
+- Z KONTEKSTU Z SIECI podaj, ile osób w Polsce ogląda tę grę i ilu ją streamuje (jeśli jest w kontekście), oraz największe wydarzenia dziś.
+- Styl: radiowy, lekko komentatorski, angażujący, kobiecy, ale rzeczowy. Krótkie, rytmiczne zdania.
+- Zakończ lekkim CTA: ${ctaTxt}. Nienachalnie, bez błagania.
+- Długość: ok. 150–180 słów (ok. minuty mówienia).` : `
 TRYB: STREAM ZAKOŃCZONY / OFFLINE.
-- Ok. 50% wypowiedzi poświęć najnowszej zakończonej sesji: jak poszło, porównanie z historią (z uwzględnieniem czasu trwania), powody odchyleń.
-- Jeśli danych o sesjach jest mało, skup się bardziej na danych kanału poza sesją: liczba followersów, tempo przyrostu w ostatnich 30 dniach, suby, daty najnowszych followów i subów.
-- Pozostałe 50%: wzorce (najlepsze godziny i dni tygodnia, gry, przyczyny), rynek polski, kalendarz, patche/premiery/wydarzenia, stosunek widzów do streamujących dla gier, w które gram.
-- Styl: bardziej analityczny, spokojny, rzeczowy. Bez CTA do widzów.
-- Długość: tekst do wypowiedzenia ok. 280–320 słów (do 2 minut mówienia). Możesz wyszukać w sieci do ok. 10 razy.`;
+- Ok. 50% wypowiedzi: najnowsza zakończona sesja — jak poszła, porównanie z historią (z uwzględnieniem czasu trwania), powody odchyleń.
+- Gdy danych o sesjach mało, skup się na danych kanału: followersi, tempo przyrostu w 30 dni, suby, daty ostatnich followów i subów.
+- Pozostałe 50%: wzorce (najlepsze godziny i dni, gry, przyczyny), rynek polski, kalendarz, patche/premiery/wydarzenia, stosunek widzów do streamujących dla gier, w które gra.
+- Styl: analityczny, spokojny, rzeczowy. Bez CTA do widzów.
+- Długość: ok. 280–320 słów (do 2 minut mówienia).`;
 
-    return `
-Jesteś analitykiem kanału Twitch streamera ${channelName} (polski rynek streamingowy). Poniżej masz wszystkie dane z widżetu, wyliczenia wykonane w kodzie oraz dzisiejszą datę. Kalendarz (święta, dni wolne, wydarzenia) sprawdzasz sam w sieci.
+    const netBlock = (ctx.calendar || ctx.games)
+        ? `KALENDARZ I WYDARZENIA (sprawdzone w sieci na dziś):\n${ctx.calendar || 'nie udało się sprawdzić'}\n\nGRY I RYNEK TWITCHA (sprawdzone w sieci):\n${ctx.games || 'nie udało się sprawdzić'}`
+        : 'Wyszukiwarka była niedostępna: bieżących danych z sieci (kalendarz, święta, gry, patche, wydarzenia, stosunek widzów do streamujących) NIE udało się sprawdzić — powiedz to krótko i niczego nie zmyślaj.';
+
+    return `Jesteś analitykiem kanału Twitch streamera ${channelName} (polski rynek streamingowy). Masz dane z widżetu, wyliczenia z kodu oraz zweryfikowany w sieci kontekst. Nie wyszukujesz niczego sam — korzystaj tylko z poniższych danych.
 
 ═══ ZASADY BEZWZGLĘDNE ═══
-1. Nigdy nie czytaj ani nie wymieniaj nicków i nazw użytkowników (poza nazwą ${channelName}). Nigdy nie mów o zarobkach, kwotach, pieniądzach ani przychodach z subskrypcji, bitsów i podobnych. Liczby followersów i subów wolno podawać.
-2. Absolutny zakaz kryptoreklamy: nie wymieniaj nazw firm, portali, serwisów, narzędzi, sklepów, marek ani produktów. Wyjątki: tytuły gier, nazwy studiów i wydawców gier oraz sam Twitch. Źródła opisuj ogólnie (np. „publiczne statystyki Twitcha”), bez nazw stron.
-3. Nigdy nie doradzaj streamerowi zmiany gry ani przeniesienia streamowania na inną porę lub dzień (np. „graj wieczorem zamiast rano”). WOLNO natomiast i warto: zauważać zmiany aktywności w trakcie jego streama (np. wzrost widowni około 12:00, spadek około 14:00) i podawać ich prawdopodobne przyczyny (koniec pracy lub dojazd, przerwa obiadowa, lekcje, początek weekendu itp.), a także informować o stosunku streamujących do widzów i o wydarzeniach — jako obserwacje („dane pokazują…”), bez poleceń zmiany.
-4. Prawda, bez słodzenia i bez różowych okularów, ale też bez pesymizmu: szukaj plusów, wspominaj o minusach. Nie zmyślaj liczb. Odróżniaj twarde dane z historii, szacunki (pola zaczynające się od „szac_”) i prognozy/hipotezy. Jeśli czegoś nie da się sprawdzić, powiedz to wprost.
-5. Świeżość: dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Wszystko, co sprawdzasz w sieci, weryfikuj na DZIŚ. Patche, aktualizacje, premiery, zmiany wersji (np. beta→pełna wersja), eventy: wspominaj tylko te, które dzieją się dziś lub w przyszłości (podaj kiedy). Zdarzenia z przeszłości dozwolone tylko do 7 dni wstecz i tylko jeśli realnie wpływają na Twitcha; starsze pomijaj. Jeśli nie potwierdzisz informacji na dziś — nie wspominaj o niej.
-   KALENDARZA NIE MASZ PODANEGO — sam go sprawdź w sieci na podstawie dzisiejszej daty (zob. punkt I).
-6. Dopasuj analizę do polskich widzów i polskiego Twitcha. Statystyki światowe tylko wtedy, gdy są naprawdę istotne.
-7. Zawsze rozpocznij od przedstawienia się jako analityk kanału ${channelName}, powiedz jaki jest dziś dzień i data oraz godzina. Następnie: ${note}
+1. Nigdy nie czytaj ani nie wymieniaj nicków i nazw użytkowników (poza nazwą ${channelName}). Nigdy nie mów o zarobkach, kwotach ani pieniądzach z subskrypcji, bitsów itp. Liczby followersów i subów wolno podawać.
+2. Zakaz kryptoreklamy: nie wymieniaj nazw firm, portali, serwisów, narzędzi, sklepów, marek ani produktów. Wyjątki: tytuły gier, studia i wydawcy gier oraz sam Twitch. Źródła opisuj ogólnie (np. „publiczne statystyki Twitcha”).
+3. Nigdy nie doradzaj zmiany gry ani przeniesienia streamowania na inną porę lub dzień. WOLNO i warto: zauważać zmiany aktywności w trakcie jego streama (np. wzrost około 12:00, spadek około 14:00) z prawdopodobnymi przyczynami (koniec pracy, dojazd, obiad, lekcje, początek weekendu), informować o stosunku streamujących do widzów i o wydarzeniach — jako obserwacje („dane pokazują…”), bez poleceń zmian.
+4. Prawda, bez słodzenia, ale i bez pesymizmu: szukaj plusów, wspominaj minusy. Nie zmyślaj liczb. Odróżniaj twarde dane z historii, szacunki (pola „szac_”) i hipotezy. Czego nie da się sprawdzić — powiedz wprost.
+5. Świeżość: dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Wspominaj tylko wydarzenia z kontekstu z sieci (dzisiejsze, przyszłe lub z ostatnich 7 dni). Niepotwierdzonego nie wspominaj.
+6. Dopasuj analizę do polskich widzów i polskiego Twitcha.
+7. Zacznij od przedstawienia się jako analityk kanału ${channelName}, powiedz jaki jest dziś dzień, data i godzina. Następnie: ${note}
 
-═══ CO MASZ ANALIZOWAĆ ═══
-A. Wzorce: w jakie gry grał, w jakie dni tygodnia, o której zaczynał i kończył. Wskaż najlepsze godziny i dni (użyj gotowych wyliczeń z "wyliczeniaSerwera", nie licz w pamięci) i szukaj PRZYCZYN: np. piątkowy wieczór — początek weekendu; święto lub dzień wolny od pracy; wakacje albo ferie; przedświąteczne przygotowania; pora roku (weekend w wakacje wygląda inaczej niż weekend zimą); duże wydarzenia, które mogły wciągnąć polską widownię (zob. punkt I).
-A2. Wzorce WEWNĄTRZ streama: w osi czasu ("przebieg", każdy punkt ma "godzina" zegarową) oraz w słupkach z "aktualnie" znajdź momenty wzrostu i spadku widowni i czatu, podaj o której godzinie to nastąpiło i wyjaśnij prawdopodobną przyczynę (koniec pracy, dojazd, obiad, lekcje, początek weekendu, rajd, dropy, zmiana gry lub tytułu).
-B. Gry: ostatnio streamowane gry mają większą wagę niż stare (waga już policzona w danych) — poświęć im więcej uwagi. Dla tych gier sprawdź w sieci oglądalność w Polsce i w czołówce Twitcha, stosunek liczby widzów do liczby streamujących (mało streamujących, duże zapotrzebowanie = korzystny stosunek) oraz w jakie dni i godziny ten stosunek bywa najlepszy — podaj to wyłącznie jako informację (zasada 3). Sprawdź też patchnote’y, aktualizacje, premiery i duże wydarzenia dotyczące tych gier (zasada 5). Porównaj oglądalność tej gry z topowymi grami w Polsce. Poinformuj też, jaka inna duża gra lub wydarzenie na Twitchu może teraz ściągać widzów (bez sugerowania zmian).
-C. Tytuł i gra a wyniki: jeśli w tytule jest np. „DROP”/„drops”, zastanów się, czy dropy mogły przyciągnąć widzów; sprawdź w "przebieg" i polach czatu, czy wzrost widowni przełożył się na piszących (unikalni czatujący, wiadomości). Jeśli widzów przybyło, a czat nie drgnął — to widzowie głównie „po nagrody”; jeśli rosły oba — stream faktycznie dobrze trzyma. Rozróżniaj te sytuacje.
-D. Korelacje: więcej widzów + więcej wiadomości = dobry znak; mało widzów, ale obecnych przez większość streama = stabilna publiczność; mało widzów i pisze ta sama grupa osób (wysoki udział czatujących względem unikalnych widzów) = własne grono odbiorców. Wskaż, która z tych sytuacji wygląda na prawdziwą.
-E. Rajdy: pole "skokiWidzow" wskazuje nagłe wzrosty z szybkim odpływem. Jeśli taki wzorzec jest, powiedz, że to prawdopodobnie rajd lub hosting (jako hipoteza, nie fakt), że widownia szybko odpłynęła i jak wygląda widownia „bazowa” bez tego skoku. Nie podawaj nicków.
-F. Czas trwania: nie porównuj sesji 1:1 — dłuższy stream daje inne sumy niż krótszy. Używaj wartości znormalizowanych (na godzinę) z "porownanieNajnowszejSesji" i wspominaj o różnicy długości.
-G. Tempo rozwoju: ile followersów przybyło w ostatnich 30 dniach i jaki to wzrost procentowy, ile saldo po odliczeniu unfollowów, jak wyglądają suby (nowe i wygasłe), kiedy wpadł ostatni follow i ostatni sub. Zauważ i nazwij dobry okres, jeśli suby/followersi rosną. Zaznacz, że część danych subów jest przybliżona, jeśli widżet działa krótko.
-H. Za każdym razem szukaj PRZYCZYN odchyleń, a nie samego „o 5% więcej niż zwykle”: lepszy stream, lepsza godzina, dzień wolny, gra, wydarzenie zewnętrzne, rajd, dropy.
-I. KALENDARZ I WYDARZENIA — sprawdź SAM w sieci, na podstawie dzisiejszej daty (nic nie jest wgrane): czy dziś lub w najbliższych dniach jest święto państwowe, dzień wolny od pracy, długi weekend lub „most”; czy to weekend w wakacje, w ferie (ferie zimowe sprawdź z podziałem na województwa, jeśli to ich okres), w zimie czy poza sezonem; czy trwają przygotowania świąteczne lub inny okres obniżonej oglądalności. Sprawdź też wydarzenia, które w Polsce masowo odciągają widzów z Twitcha: matury i egzaminy, mecze reprezentacji Polski, duże gale freak-fightowe, finały dużych turniejów e-sportowych (np. IEM Katowice) oraz inne ważne premiery i wydarzenia. Wspominaj wyłącznie to, co potwierdziłeś dla dzisiejszej daty (zasada 5), i wyjaśnij, jak mogło to wpłynąć na widownię.
+═══ CO ANALIZOWAĆ ═══
+A. Wzorce: gry, dni tygodnia, godziny startu i końca. Najlepsze godziny i dni bierz z "wyliczeniaSerwera" (nie licz w pamięci) i szukaj PRZYCZYN (początek weekendu, święto, wakacje/ferie, pora roku, wydarzenia z kontekstu).
+A2. Wzorce WEWNĄTRZ streama: w "przebieg" (punkty mają "godzina") i w słupkach z "aktualnie" znajdź wzrosty i spadki widowni i czatu, podaj godzinę i prawdopodobną przyczynę.
+B. Gry: nowsze mają większą wagę (policzona). Wykorzystaj kontekst o oglądalności, stosunku widzów do streamujących, patchach i eventach — wyłącznie jako informację (zasada 3).
+C. Tytuł i gra a wyniki: przy „DROP”/„drops” w tytule sprawdź, czy wzrost widowni przełożył się na piszących. Widzów więcej, a czat bez zmian = widzowie głównie „po nagrody”; rosną oba = stream faktycznie trzyma.
+D. Korelacje: więcej widzów + więcej wiadomości = dobry znak; mało widzów, ale obecnych długo = stabilna publiczność; mało widzów i pisze ta sama grupa (wysoki udział czatujących) = własne grono. Wskaż, która sytuacja wygląda na prawdziwą.
+E. Rajdy: "skokiWidzow" = nagły wzrost z szybkim odpływem. Powiedz, że to prawdopodobnie rajd lub hosting (hipoteza), jak wygląda widownia „bazowa” bez skoku. Bez nicków.
+F. Czas trwania: nie porównuj sesji 1:1 — używaj wartości na godzinę z "porownanieNajnowszejSesji" i wspominaj o różnicy długości.
+G. Tempo rozwoju: followersi w 30 dni i wzrost procentowy, saldo po unfollowach, suby (nowe i wygasłe), data ostatniego followa i suba. Nazwij dobry okres, jeśli rosną. Zaznacz, że część danych subów jest przybliżona.
+H. Zawsze szukaj PRZYCZYN odchyleń, nie samego „o 5% więcej niż zwykle”.
 ${modeBlock}
 
 ═══ DANE ═══
-DZISIEJSZA DATA (z zegara serwera, czas polski) — święta, dni wolne i wydarzenia sprawdzasz sam w sieci:
-${JSON.stringify(cal, null, 2)}
+KONTEKST Z SIECI:
+${netBlock}
 
-CZAS I STAN TERAZ (z widżetu):
-${JSON.stringify(teraz, null, 2)}
+CZAS I STAN TERAZ:
+${J(teraz)}
 
-DANE KANAŁU POZA SESJAMI (followersi, suby, tempo wzrostu):
-${JSON.stringify(kanal, null, 2)}
+KANAŁ POZA SESJAMI:
+${J(kanal)}
 
-NAJNOWSZA SESJA (live: trwa; offline: ostatnia zakończona; "przebieg" to oś czasu: min = minuta od startu, v = średnia widzów, msg = wiadomości w tym odcinku, cz = skumulowana liczba unikalnych czatujących):
-${JSON.stringify(currentSession, null, 2)}
+NAJNOWSZA SESJA ("przebieg": min = minuta od startu, v = średnia widzów, msg = wiadomości w odcinku, cz = skumulowani unikalni czatujący):
+${J(currentSession)}
 
-HISTORIA SESJI (najnowsze pierwsze; część ma "przebieg"):
-${JSON.stringify(sessionsHistory, null, 2)}
+HISTORIA SESJI (najnowsze pierwsze):
+${J(sessionsHistory)}
 
-WYLICZENIA SERWERA (średnie ważone — nowsze sesje ważą więcej; normalizacja na godzinę; porównania procentowe):
-${JSON.stringify(derived, null, 2)}
+WYLICZENIA SERWERA (średnie ważone, normalizacja na godzinę, porównania %):
+${J(derived)}
 
 ═══ FORMAT ODPOWIEDZI ═══
-Zwróć WYŁĄCZNIE obiekt JSON (bez markdownu i komentarzy) z polami:
-- "textResponse": pełny tekst wypowiedzi,
-- "audioPrompt": ta sama wypowiedź pod syntezator mowy: czysty tekst bez markdownu, wypunktowań, symboli i emoji, krótkie zdania, liczby i godziny zapisane tak, by dobrze brzmiały na głos po polsku, bez adresów stron. Zachowaj wymaganą długość z sekcji TRYB.
-`;
+Zwróć WYŁĄCZNIE gotowy tekst wypowiedzi do przeczytania na głos po polsku — czysty tekst, bez markdownu, wypunktowań, symboli, emoji, nagłówków, JSON-a i adresów stron. Krótkie zdania; liczby i godziny zapisane tak, by dobrze brzmiały na głos. Zachowaj długość z sekcji TRYB.`;
 }
 
-// Gemini TTS zwraca surowe PCM 16-bit / 24 kHz / mono — pakujemy w WAV, żeby przeglądarka mogła odtworzyć
+// ═══════════════ GŁOS (TTS) ═══════════════
 function pcmToWav(pcm, sampleRate = 24000, channels = 1, bits = 16) {
     const h = Buffer.alloc(44);
     h.write('RIFF', 0); h.writeUInt32LE(36 + pcm.length, 4); h.write('WAVE', 8);
@@ -294,7 +371,6 @@ function pcmToWav(pcm, sampleRate = 24000, channels = 1, bits = 16) {
     return Buffer.concat([h, pcm]);
 }
 
-// Wyciąga audio (base64) z odpowiedzi Interactions API
 function pickAudio(i) {
     if (i?.output_audio?.data) return i.output_audio.data;
     const steps = i?.steps || i?.outputs || [];
@@ -304,11 +380,9 @@ function pickAudio(i) {
     return null;
 }
 
-// Gemini 3.8 TTS działa przez Interactions API: tekst w input, głos w generation_config.speech_config, format w response_format.
-// Styl (live = radiowy, offline = analityczny) próbujemy z krótkim limitem czasu. Jeśli zawiedzie (błąd, brak audio, timeout),
-// OD RAZU wracamy do sprawdzonego wariantu bez stylu — i przez 10 minut nie marnujemy czasu na styl. Dzięki temu styl nigdy nie zagłuszy głosu.
+// Styl próbujemy z krótkim limitem; gdy zawiedzie, wracamy do wariantu bez stylu i przez 10 min nie marnujemy zapytań na styl.
 let styleOffUntil = 0;
-const STYLE_TIMEOUT_MS = Number(process.env.TTS_STYLE_TIMEOUT_MS) || 20000;
+const STYLE_TIMEOUT_MS = Number(process.env.TTS_STYLE_TIMEOUT_MS) || 25000;
 async function makeAudio(text, models = TTS_MODELS, mode = 'offline') {
     let lastErr = null;
     const style = TTS_STYLES[mode] || TTS_STYLES.offline;
@@ -323,7 +397,7 @@ async function makeAudio(text, models = TTS_MODELS, mode = 'offline') {
                     input: [{ type: 'user_input', content: [part] }],
                     response_format: { type: 'audio' },
                     generation_config: { speech_config: [{ voice: TTS_VOICE }] }
-                }), st ? STYLE_TIMEOUT_MS : 30000, `TTS ${model}`);
+                }), st ? STYLE_TIMEOUT_MS : 45000, `TTS ${model}`);
                 const b64 = pickAudio(interaction);
                 if (!b64) {
                     lastErr = new Error(`TTS ${model}: brak audio w odpowiedzi`);
@@ -331,15 +405,14 @@ async function makeAudio(text, models = TTS_MODELS, mode = 'offline') {
                     break;
                 }
                 const buf = Buffer.from(b64, 'base64');
-                // unary zwraca gotowy WAV (RIFF); gdyby przyszedł surowy PCM — dopinamy nagłówek
                 const out = buf.slice(0, 4).toString('ascii') === 'RIFF' ? buf : pcmToWav(buf);
                 console.log(`TTS OK: ${model}${st ? ` (styl: ${mode})` : ' (bez stylu)'}`);
                 return out.toString('base64');
             } catch (e) {
                 lastErr = e;
                 console.error(`TTS (${model}${st ? ', ze stylem' : ', bez stylu'}) nie zadziałał:`, e.message);
-                if (st) { styleOffUntil = Date.now() + 10 * 60e3; continue; } // styl zawiódł → natychmiast wariant bez stylu
-                break; // bez stylu też się nie udało → następny model
+                if (st) { styleOffUntil = Date.now() + 10 * 60e3; continue; }
+                break;
             }
         }
     }
@@ -347,12 +420,23 @@ async function makeAudio(text, models = TTS_MODELS, mode = 'offline') {
     return null;
 }
 
+// Ten sam tekst + tryb + głos = ten sam plik audio z pamięci (ponowne odsłuchanie analizy nie kosztuje zapytań do TTS)
+function makeAudioCached(text, mode) {
+    const key = crypto.createHash('sha1').update(`${mode}|${TTS_VOICE}|${text}`).digest('hex');
+    return cacheAudio.memo(key, TTL.audio, async () => {
+        const a = await makeAudio(text, TTS_MODELS, mode);
+        if (!a) throw new Error('Model nie zwrócił audio');
+        return a;
+    });
+}
+
+// ═══════════════ ENDPOINTY ═══════════════
 app.get('/', (req, res) => res.send('OK'));
 app.get('/health', (req, res) => res.json({ ok: true, textModel: TEXT_MODEL, ttsModels: TTS_MODELS, think: THINK }));
 
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
-// Diagnostyka: mierzy czas każdego modelu (tekst + głos) — otwórz w przeglądarce /diag
+// Diagnostyka (uwaga: każde otwarcie to kilka zapytań do Gemini — używaj tylko do testów)
 app.get('/diag', async (req, res) => {
     const timed = async (label, fn) => {
         const t0 = Date.now();
@@ -360,20 +444,12 @@ app.get('/diag', async (req, res) => {
         catch (e) { return { label, ok: false, ms: Date.now() - t0, error: e.message }; }
     };
     const out = await Promise.all([
-        ...TEXT_MODELS.flatMap(m => [
-            timed('tekst (interactions) ' + m, () => withTimeout(ai.interactions.create({
-                model: m, input: 'Odpowiedz jednym słowem: ok', generation_config: { thinking_level: 'low' }
-            }), 45000, 'tekst')),
-            timed('tekst (generateContent) ' + m, () => withTimeout(ai.models.generateContent({
-                model: m, contents: 'Odpowiedz jednym słowem: ok', config: { thinkingConfig: { thinkingLevel: 'low' } }
-            }), 45000, 'tekst'))
-        ]),
+        ...TEXT_MODELS.map(m => timed('tekst ' + m, () => genOne('Odpowiedz jednym słowem: ok', false, 45000, m, 'low'))),
         ...TTS_MODELS.map(m => timed('głos ' + m, () => makeAudio('Cześć, test głosu.', [m])))
     ]);
     res.json(out);
 });
 
-// Strona testowa głosu: /tts-test  (opcjonalnie ?model=...&text=...&mode=live|offline)
 app.get('/tts-test', async (req, res) => {
     const text = String(req.query.text || 'Cześć! Sprawdzamy, czy głos działa poprawnie i brzmi naturalnie po polsku.').slice(0, 600);
     const models = req.query.model ? [String(req.query.model)] : TTS_MODELS;
@@ -388,14 +464,12 @@ app.get('/tts-test', async (req, res) => {
     }
 });
 
-// Osobny endpoint głosu — widżet woła go po otrzymaniu tekstu (mode: live | offline wybiera styl głosu)
 app.post('/api/tts', async (req, res) => {
     try {
-        const text = String(req.body?.text || '').slice(0, 1500);
+        const text = String(req.body?.text || '').slice(0, 3500);
         const mode = req.body?.mode === 'live' ? 'live' : 'offline';
         if (!text) return res.status(400).json({ success: false, error: 'Brak tekstu' });
-        const audio = await makeAudio(text, TTS_MODELS, mode);
-        if (!audio) throw new Error('Model nie zwrócił audio');
+        const audio = await makeAudioCached(text, mode);
         res.json({ success: true, audio });
     } catch (error) {
         console.error('Błąd TTS:', error);
@@ -406,40 +480,39 @@ app.post('/api/tts', async (req, res) => {
 app.post('/api/analyze', async (req, res) => {
     try {
         const body = req.body || {};
-        const { sessionsHistory = [], currentSession = null, channelName = 'Dolaricious', noData = false } = body;
+        const { sessionsHistory = [], currentSession = null, channelName = 'Dolaricious', noData = false, kanal = {}, teraz = {} } = body;
         const live = body.tryb === 'live' || (body.tryb == null && !!currentSession?.trwaJeszcze);
         const mode = live ? 'live' : 'offline';
 
-        // Zupełny brak danych (ani sesji, ani danych kanału) → krótka gotowa wypowiedź, bez modelu tekstowego
         if (noData) {
             const txt = `Cześć! Tu analityk kanału ${channelName}. Na razie nie mam zapisanych żadnych zakończonych sesji ani danych kanału, więc nie ma jeszcze czego analizować. Po pierwszej zakończonej transmisji omówię wyniki, a potem szerszy obraz polskiego Twitcha.`;
             return res.json({ success: true, analysis: txt, audioPrompt: txt, searchUsed: false, sources: [], mode });
         }
 
         const cal = calendarContext();
-        const derived = derive(currentSession, sessionsHistory);
-        const prompt = buildPrompt({ ...body, live, currentSession: withClock(currentSession), sessionsHistory: sessionsHistory.map(withClock) }, cal, derived);
-        const lim = LIMITS[mode], think = THINK[mode];
+        const h = parseInt(cal.dzis.godzina, 10);
+        // Klucz pamięci podręcznej: te same dane = ta sama analiza (0 zapytań do Gemini)
+        const key = live
+            ? `A|live|${currentSession?.start}|${currentSession?.glownaGra || teraz.gra || ''}|${teraz.tytul || currentSession?.tytul || ''}`
+            : `A|off|${currentSession?.start}|${currentSession?.koniec}|${currentSession?.wiadomosciNaCzacie}|${kanal.followersiLacznie}|${kanal.subyLacznie}|${cal.dzis.dataISO}|${Math.floor(h / 2)}`;
+        if (body.odswiez) cacheMain.del(key);
 
-        // UWAGA: wyszukiwanie Google nie działa razem z wymuszonym JSON — JSON parsujemy ręcznie
-        let result = null, searchUsed = false, lastErr = null;
-        try {
-            result = await genRace(prompt, true, lim.search, think);
-            searchUsed = true;
-        } catch (e) { lastErr = e; console.error('Analiza z wyszukiwaniem nie wyszła:', e.message); }
-        if (!result) {
-            const fallbackPrompt = prompt + '\n\nUWAGA: wyszukiwarka jest teraz niedostępna. Opieraj się wyłącznie na przesłanych danych i dzisiejszej dacie, a w częściach wymagających sieci (kalendarz i święta, gry, patche, wydarzenia, stosunek widzów do streamujących) powiedz krótko, że bieżących danych z sieci nie udało się sprawdzić. Niczego nie zmyślaj.';
-            try { result = await genRace(fallbackPrompt, false, lim.fallback, 'low'); }
-            catch (e) { lastErr = e; console.error('Analiza bez wyszukiwania nie wyszła:', e.message); }
-        }
-        if (!result) throw lastErr || new Error('Analiza nie powiodła się');
+        const result = await cacheMain.memo(key, live ? TTL.analysisLive : TTL.analysisOffline, async () => {
+            const lim = LIMITS[mode], deadline = Date.now() + lim.total;
+            const derived = derive(currentSession, sessionsHistory);
+            const ctx = await research(body, cal, mode);           // zwykle z pamięci podręcznej
+            const searchUsed = !!(ctx.calendar || ctx.games);
+            const prompt = buildPrompt({ ...body, live, currentSession: withClock(currentSession), sessionsHistory: sessionsHistory.map(withClock) }, cal, derived, ctx);
+            const r = await genSeq(prompt, false, lim.analysis, THINK[mode], deadline);
+            const parsed = String(r.text).trim().startsWith('{') ? parseJson(r.text) : null;
+            const text = cleanSpeech(parsed?.audioPrompt || parsed?.textResponse || r.text);
+            if (!text) throw new Error('Pusta odpowiedź modelu');
+            // Gdy nie udało się zbadać sieci, nie utrwalamy tej uboższej analizy na długo
+            if (!searchUsed) setTimeout(() => cacheMain.del(key), 60e3).unref?.();
+            return { text, searchUsed, sources: ctx.sources };
+        });
 
-        const raw = result.text;
-        const parsed = parseJson(raw) || { textResponse: raw, audioPrompt: raw };
-        const textResponse = parsed.textResponse || raw;
-        const audioPrompt = parsed.audioPrompt || textResponse;
-
-        res.json({ success: true, analysis: textResponse, audioPrompt, searchUsed, sources: result.sources || [], mode });
+        res.json({ success: true, analysis: result.text, audioPrompt: result.text, searchUsed: result.searchUsed, sources: result.sources || [], mode });
     } catch (error) {
         console.error('Błąd podczas analizy:', error);
         res.status(500).json({ success: false, error: error.message });
