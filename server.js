@@ -37,6 +37,10 @@ const MAX_ATTEMPTS = Number(process.env.MAX_ATTEMPTS) || 3;
 const RESEARCH_MS = Number(process.env.RESEARCH_MS) || 60000;                 // jeden model w badaniu sieci (wyszukiwanie trwa dłużej)
 const RESEARCH_BUDGET_MS = Number(process.env.RESEARCH_BUDGET_MS) || 100000;   // całe badanie sieci
 const TOTAL_BUDGET_MS = Number(process.env.TOTAL_BUDGET_MS) || 240000;         // badanie + analiza razem
+// TWARDY LIMIT blokady modelu: nawet gdy Gemini napisze „spróbuj za 3 dni”, próbujemy ponownie najpóźniej po 12 h
+const MAX_BLOCK_MS = Number(process.env.MAX_BLOCK_MS) || 12 * 3600e3;
+// Blokada krótsza niż to jest „miękka” (limit minutowy / chwilowy błąd) — gdy wszystkie modele są wstrzymane, próbujemy je mimo blokady
+const SOFT_BLOCK_MS = 15 * 60e3;
 
 // Czas życia pamięci podręcznej
 const TTL = {
@@ -73,7 +77,7 @@ const retryHint = e => {
     if (!a) return 0;
     const t = a[1], g = re => { const x = t.match(re); return x ? Number(x[1]) : 0; };
     const ms = (g(/([\d.]+)\s*h/i) * 3600 + g(/([\d.]+)\s*m(?!s)/i) * 60 + g(/([\d.]+)\s*s/i)) * 1000;
-    return ms ? Math.min(Math.ceil(ms) + 2000, 24 * 3600e3) : 0;
+    return ms ? Math.min(Math.ceil(ms) + 2000, MAX_BLOCK_MS) : 0;
 };
 function blockForText(e, model) {
     const m = String(e?.message || e), now = Date.now();
@@ -81,8 +85,8 @@ function blockForText(e, model) {
     if (isQuota(e)) {
         const s = strikes.get(model), n = (s && now - s.t < 2 * 3600e3) ? s.n + 1 : 1;
         strikes.set(model, { n, t: now });
-        if (/PerDay|per day|daily/i.test(m)) return retryHint(e) || 60 * 60e3;
-        return Math.max(retryHint(e), [60e3, 5 * 60e3, 30 * 60e3, 60 * 60e3][Math.min(n - 1, 3)]);
+        if (/PerDay|per day|daily/i.test(m)) return retryHint(e) || 60 * 60e3;   // limit dzienny: czas od Google, ale max MAX_BLOCK_MS
+        return Math.max(retryHint(e), [60e3, 3 * 60e3, 10 * 60e3][Math.min(n - 1, 2)]);
     }
     if (/przekroczono limit/.test(m)) return 2 * 60e3;                                            // timeout → model odpoczywa 2 min
     if (/\b(500|503)\b|UNAVAILABLE|overloaded/i.test(m)) return 2 * 60e3;
@@ -90,6 +94,7 @@ function blockForText(e, model) {
 }
 setInterval(() => { const n = Date.now(); for (const [k, v] of strikes) if (n - v.t > 2 * 3600e3) strikes.delete(k); }, 30 * 60e3).unref();
 
+const blockedSummary = () => [...blocked].filter(([, t]) => t > Date.now()).map(([k, t]) => `${k} (${Math.ceil((t - Date.now()) / 60e3)} min)`).join(', ');
 const withTimeout = (p, ms, label) => Promise.race([
     p, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: przekroczono limit ${Math.round(ms / 1000)}s`)), ms))
 ]);
@@ -150,7 +155,6 @@ async function genOne(prompt, search, ms, model, think) {
         if (search) req.tools = [{ type: 'google_search' }];
         const i = await withTimeout(ai.interactions.create(req, { maxRetries: 0 }), ms, `Analiza (${model})`);   // maxRetries:0 — SDK domyślnie ponawia 429 do 4 razy (do 30 s), a to marnuje czas i zapytania
         if (!i.output_text) throw new Error('pusta odpowiedź');
-        strikes.delete(model);
         return { text: i.output_text, model, via: 'interactions', sources: collectSources(i) };
     } catch (e) {
         if (/przekroczono limit/.test(e.message) || isQuota(e)) throw e;
@@ -159,32 +163,49 @@ async function genOne(prompt, search, ms, model, think) {
         console.error(`Interactions (${model}) nie wyszło:`, e.message);
     }
     const r = await gen(prompt, search, ms, model, noThink(model) ? null : think);
-    strikes.delete(model);
     const chunks = r.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
     return { text: r.text, model, via: 'generateContent', sources: chunks.map(c => c.web?.uri).filter(Boolean) };
 }
 
-// Modele PO KOLEI: każdy dostaje pełne `ms` (nie więcej niż zostało z budżetu); błąd = od razu następny; pomijamy modele wstrzymane (limit / brak modelu / timeout).
+// Modele PO KOLEI: każdy dostaje pełne `ms` (nie więcej niż zostało z budżetu); błąd = od razu następny; pomijamy modele wstrzymane.
 // Odrzucenia 429 i 404 przychodzą od razu, więc nie zużywają limitu prób.
+// Blokady: limit samego modelu blokuje model wszędzie; ogólny 429 przy WYSZUKIWANIU blokuje model tylko dla wyszukiwania (klucz 'search|model'),
+// bo wyczerpany limit wyszukiwarki nie oznacza, że model nie napisze analizy bez niej.
+// Gdy WSZYSTKIE modele są wstrzymane krótką („miękką”) blokadą, robimy drugie przejście mimo blokad, zamiast od razu zwracać błąd.
 async function genSeq(prompt, search, ms, think, models = TEXT_MODELS, maxAttempts = MAX_ATTEMPTS, deadline = Infinity) {
     const t0 = Date.now(), errs = [];
-    let attempts = 0;
-    for (const m of models) {
-        if (attempts >= maxAttempts) break;
-        const left = deadline - Date.now();
-        if (left < 8000) { errs.push('budżet czasu wyczerpany'); break; }
-        if (isBlocked(m)) { errs.push(`${m}: 429 RESOURCE_EXHAUSTED — model wstrzymany po przekroczeniu limitu`); continue; }
-        attempts++;
-        try {
-            const r = await genOne(prompt, search, Math.min(ms, left), m, think);
-            console.log(`Model OK (${r.model}, ${r.via}${search ? ', z wyszukiwaniem' : ''}, think=${think}): ${Date.now() - t0} ms`);
-            return r;
-        } catch (e) {
-            errs.push(`${m}: ${e.message}`); console.error('Model zawiódł:', e.message);
-            const b = blockForText(e, m); if (b) blocked.set(m, Date.now() + b);
-            if (isQuota(e) || /not found|NOT_FOUND|\b404\b/i.test(e.message)) attempts--;   // natychmiastowe odrzucenie nie zużywa próby
+    let attempts = 0, tried = 0;
+    const remaining = m => Math.max(blocked.get(m) || 0, search ? (blocked.get('search|' + m) || 0) : 0) - Date.now();
+    const pass = async force => {
+        for (const m of models) {
+            if (attempts >= maxAttempts) return null;
+            const left = deadline - Date.now();
+            if (left < 8000) { errs.push('budżet czasu wyczerpany'); return null; }
+            const rem = remaining(m);
+            if (rem > 0 && (!force || rem > SOFT_BLOCK_MS)) {
+                if (!force) errs.push(`${m}: 429 RESOURCE_EXHAUSTED — model wstrzymany po przekroczeniu limitu (jeszcze ok. ${Math.ceil(rem / 60e3)} min)`);
+                continue;
+            }
+            attempts++; tried++;
+            try {
+                const r = await genOne(prompt, search, Math.min(ms, left), m, think);
+                blocked.delete(m); blocked.delete('search|' + m); strikes.delete(m); strikes.delete('search|' + m);
+                console.log(`Model OK (${r.model}, ${r.via}${search ? ', z wyszukiwaniem' : ''}, think=${think}): ${Date.now() - t0} ms`);
+                return r;
+            } catch (e) {
+                const msg = String(e?.message || e);
+                errs.push(`${m}: ${msg}`); console.error('Model zawiódł:', msg);
+                const key = (search && isQuota(e) && !/for model|PerDay|per day|daily/i.test(msg)) ? 'search|' + m : m;
+                const b = Math.min(blockForText(e, key), MAX_BLOCK_MS);
+                if (b) blocked.set(key, Date.now() + b);
+                if (isQuota(e) || /not found|NOT_FOUND|\b404\b/i.test(msg)) attempts--;   // natychmiastowe odrzucenie nie zużywa próby
+            }
         }
-    }
+        return null;
+    };
+    let r = await pass(false);
+    if (!r && tried === 0 && deadline - Date.now() >= 8000) { console.log('Wszystkie modele wstrzymane krótką blokadą — próbuję mimo to'); r = await pass(true); }
+    if (r) return r;
     throw new Error(errs.join(' | '));
 }
 
@@ -508,7 +529,9 @@ function makeAudioCached(text, mode) {
 
 // ═══════════════ ENDPOINTY ═══════════════
 app.get('/', (req, res) => res.send('OK'));
-app.get('/health', (req, res) => res.json({ ok: true, textModel: TEXT_MODEL, ttsModels: TTS_MODELS, think: THINK }));
+app.get('/health', (req, res) => res.json({ ok: true, textModel: TEXT_MODEL, ttsModels: TTS_MODELS, think: THINK, wstrzymane: blockedSummary() || null }));
+// Ręczne wyczyszczenie blokad modeli (np. po zmianie limitów w Google) — nie wysyła żadnych zapytań do Gemini
+app.get('/reset-limits', (req, res) => { blocked.clear(); strikes.clear(); res.json({ ok: true, wyczyszczono: true }); });
 
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -590,7 +613,7 @@ app.post('/api/analyze', async (req, res) => {
         res.json({ success: true, analysis: result.text, audioPrompt: result.text, searchUsed: result.searchUsed, sources: result.sources || [], mode });
     } catch (error) {
         console.error('Błąd podczas analizy:', error);
-        if (isQuota(error)) return res.status(429).json({ success: false, error: 'Limit Gemini wyczerpany — spróbuj za chwilę (limit minutowy) lub po ok. 9:00 (limit dzienny). Stan: ai.dev/rate-limit' });
+        if (isQuota(error)) return res.status(429).json({ success: false, error: 'Limit Gemini wyczerpany — spróbuj za chwilę (limit minutowy) lub po ok. 9:00 (limit dzienny). Stan: ai.dev/rate-limit' + (blockedSummary() ? ' · wstrzymane: ' + blockedSummary() : '') });
         res.status(500).json({ success: false, error: error.message });
     }
 });
