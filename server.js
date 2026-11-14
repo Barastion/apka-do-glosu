@@ -92,85 +92,36 @@ function parseJson(t) {
     try { return JSON.parse(c); } catch (e) {}
     const m = c.match(/\{[\s\S]*\}/);
     if (m) { try { return JSON.parse(m[0]); } catch (e) {} }
+    const ma = c.match(/"audioPrompt"\s*:\s*"([\s\S]*?)"\s*[,}]/), mt = c.match(/"textResponse"\s*:\s*"([\s\S]*?)"\s*[,}]/);
+    if (ma || mt) { const un = x => x.replace(/\\n/g, ' ').replace(/\\"/g, '"'); return { audioPrompt: ma ? un(ma[1]) : undefined, textResponse: mt ? un(mt[1]) : undefined }; }
     return null;
 }
 
-// ═══════════════ KALENDARZ POLSKI (liczony deterministycznie, bez zgadywania przez model) ═══════════════
+// ═══════════════ DATA I CZAS (jedyne, co liczy serwer; święta/wydarzenia sprawdza sam model w sieci) ═══════════════
 const TZ = 'Europe/Warsaw';
-const ymd = d => d.toISOString().slice(0, 10);
-const addDays = (d, n) => new Date(d.getTime() + n * 864e5);
-
 function warsawParts(d) {
     const f = new Intl.DateTimeFormat('pl-PL', { timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long', hour: '2-digit', minute: '2-digit', hour12: false });
     return Object.fromEntries(f.formatToParts(d).map(x => [x.type, x.value]));
 }
 const warsawYmd = d => { const p = warsawParts(d); return `${p.year}-${p.month}-${p.day}`; };
 const dayDiff = (a, b) => Math.round((Date.parse(warsawYmd(a) + 'T00:00:00Z') - Date.parse(warsawYmd(b) + 'T00:00:00Z')) / 864e5); // a − b w dniach (czas warszawski)
-
-function easter(y) { // algorytm Gaussa/Meeusa (kalendarz gregoriański)
-    const a = y % 19, b = Math.floor(y / 100), c = y % 100, d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25),
-        g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30, i = Math.floor(c / 4), k = c % 4,
-        l = (32 + 2 * e + 2 * i - h - k) % 7, m = Math.floor((a + 11 * h + 22 * l) / 451),
-        mo = Math.floor((h + l - 7 * m + 114) / 31), da = ((h + l - 7 * m + 114) % 31) + 1;
-    return new Date(Date.UTC(y, mo - 1, da));
-}
-function holidaysOf(y) {
-    const h = {}, e = easter(y);
-    [['01-01', 'Nowy Rok'], ['01-06', 'Trzech Króli'], ['05-01', 'Święto Pracy'], ['05-03', 'Święto Konstytucji 3 Maja'],
-        ['08-15', 'Wniebowzięcie NMP i Święto Wojska Polskiego'], ['11-01', 'Wszystkich Świętych'], ['11-11', 'Narodowe Święto Niepodległości'],
-        ['12-24', 'Wigilia Bożego Narodzenia (dzień wolny od 2025 r.)'], ['12-25', 'Boże Narodzenie'], ['12-26', 'Drugi dzień Bożego Narodzenia']
-    ].forEach(([md, n]) => { h[`${y}-${md}`] = n; });
-    h[ymd(e)] = 'Wielkanoc';
-    h[ymd(addDays(e, 1))] = 'Poniedziałek Wielkanocny';
-    h[ymd(addDays(e, 49))] = 'Zielone Świątki (Zesłanie Ducha Świętego)';
-    h[ymd(addDays(e, 60))] = 'Boże Ciało';
-    return h;
-}
+const clock = d => new Intl.DateTimeFormat('pl-PL', { timeZone: TZ, hour: '2-digit', minute: '2-digit', hour12: false }).format(d);
 
 function calendarContext(now = new Date()) {
-    const p = warsawParts(now), Y = +p.year, M = +p.month, D = +p.day;
-    const base = new Date(Date.UTC(Y, M - 1, D));
-    const hol = { ...holidaysOf(Y - 1), ...holidaysOf(Y), ...holidaysOf(Y + 1) };
-    const wd = d => new Intl.DateTimeFormat('pl-PL', { timeZone: 'UTC', weekday: 'long' }).format(d);
-    const nice = d => new Intl.DateTimeFormat('pl-PL', { timeZone: 'UTC', day: 'numeric', month: 'long', year: 'numeric' }).format(d);
-    const near = [];
-    for (let i = -7; i <= 21; i++) {
-        const d = addDays(base, i), n = hol[ymd(d)];
-        if (!n) continue;
-        const dow = d.getUTCDay(); // 0 nd … 6 sb
-        const o = { data: nice(d), dzienTygodnia: wd(d), dniOdDzis: i, nazwa: n };
-        if (i >= 0) {
-            if (dow === 1 || dow === 5) o.uwaga = 'długi weekend (dzień wolny przy weekendzie)';
-            else if (dow === 2 || dow === 4) o.uwaga = 'możliwy „most” — część osób weźmie wolne między świętem a weekendem';
-            else if (dow === 0 || dow === 6) o.uwaga = 'święto wypada w weekend';
-        }
-        near.push(o);
-    }
-    const season = M === 12 || M <= 2 ? 'zima' : M <= 5 ? 'wiosna' : M <= 8 ? 'lato' : 'jesień';
-    let szkola = 'rok szkolny trwa';
-    if ((M === 6 && D >= 24) || M === 7 || M === 8) szkola = 'wakacje letnie (ok. 27 czerwca – 31 sierpnia)';
-    else if (M === 12 && D >= 23) szkola = 'przerwa świąteczna w szkołach (ok. 23–31 grudnia)';
-    else if (M === 1 && D <= 6) szkola = 'przerwa świąteczna w szkołach (do ok. 6 stycznia)';
-    else if (M === 1 || M === 2) szkola = 'okres ferii zimowych (terminy różnią się w zależności od województwa — sprawdź w sieci aktualny harmonogram na bieżący rok)';
-    const dow = base.getUTCDay();
-    const todayHoliday = hol[ymd(base)] || null;
+    const p = warsawParts(now), dow = new Date(Date.UTC(+p.year, +p.month - 1, +p.day)).getUTCDay();
     return {
         dzis: {
-            data: nice(base), dzienTygodnia: wd(base), godzina: `${p.hour}:${p.minute}`, ymd: ymd(base),
-            weekend: dow === 0 || dow === 6, swietoDzis: todayHoliday, porRoku: season, okresSzkolny: szkola,
-            numerTygodniaWRoku: Math.ceil(((base - new Date(Date.UTC(Y, 0, 1))) / 864e5 + new Date(Date.UTC(Y, 0, 1)).getUTCDay() + 1) / 7)
-        },
-        swietaWOknie_7dniWstecz_21dniNaprzod: near,
-        cyklicznePolskieWydarzeniaDoWeryfikacji: [
-            'matury (zwykle maj — sprawdź, czy trwają teraz)',
-            'ferie zimowe (styczeń–luty, terminy zależne od województwa — sprawdź harmonogram bieżącego roku)',
-            'wakacje letnie (koniec czerwca – sierpień) i początek roku szkolnego (1 września)',
-            'mecze reprezentacji Polski w piłce nożnej (sprawdź terminarz na najbliższe dni)',
-            'duże gale freak-fightowe (sprawdź, czy któraś odbywa się dziś lub w najbliższych dniach)',
-            'duże finały e-sportowe i turnieje (np. IEM Katowice zwykle w lutym/marcu — sprawdź aktualne wydarzenia)',
-            'okazje: Walentynki 14.02, Dzień Dziecka 1.06, Halloween 31.10, Andrzejki 29–30.11, Mikołajki 6.12, Sylwester 31.12'
-        ]
+            data: new Intl.DateTimeFormat('pl-PL', { timeZone: TZ, day: 'numeric', month: 'long', year: 'numeric' }).format(now),
+            dzienTygodnia: p.weekday, godzina: `${p.hour}:${p.minute}`, dataISO: `${p.year}-${p.month}-${p.day}`, weekend: dow === 0 || dow === 6
+        }
     };
+}
+
+// Dopisuje do osi czasu sesji godzinę zegarową (minuty od startu → HH:MM), żeby model widział, o której rosła i spadała widownia
+function withClock(s) {
+    if (!s || !Array.isArray(s.przebieg) || !s.start) return s;
+    const t0 = Date.parse(s.start);
+    return { ...s, przebieg: s.przebieg.map(x => ({ godzina: clock(new Date(t0 + (x.min || 0) * 6e4)), ...x })) };
 }
 
 // ═══════════════ WYLICZENIA STATYSTYCZNE (robimy w kodzie, model tylko interpretuje) ═══════════════
@@ -251,7 +202,7 @@ function lastSessionNote(current, cal, live) {
     }
     const endD = current.koniec ? new Date(current.koniec) : new Date(startD.getTime() + (current.czasTrwaniaMin || 0) * 6e4);
     const dd = dayDiff(now, endD), hoursAgo = Math.round((now - endD) / 36e5);
-    const end = new Intl.DateTimeFormat('pl-PL', { timeZone: TZ, hour: '2-digit', minute: '2-digit' }).format(endD);
+    const end = clock(endD);
     if (dayDiff(now, startD) === 0 || dd === 0) return `Dziś był już stream: start ${current.godzinaStartu}, koniec ok. ${end}, czyli ${hoursAgo} godz. temu.`;
     return `Dziś nie było jeszcze streama. Ostatni miał miejsce ${dd === 1 ? 'wczoraj' : dd + ' dni temu'} (${current.dzienTygodnia}, start ${current.godzinaStartu}, koniec ok. ${end}).`;
 }
@@ -269,42 +220,45 @@ TRYB: STREAM TRWA (analiza „na żywo”). Prawdopodobnie widzowie też Cię s�
 - Skup się na bieżącej sesji i oceniaj bieżące wydarzenia na tle historii.
 - Obowiązkowo wspomnij: aktualną liczbę widzów, średnią sesji, liczbę wiadomości na czacie i liczbę piszących, nowe followy i suby w tej sesji (jeśli są), o której zaczął się stream, dzień tygodnia, w jaką grę i pod jakim tytułem trwa transmisja.
 - Odczytaj z słupków (pole "aktualnie": słupki widzów i czatu oraz ich trendy), czy trend widowni i czatu jest rosnący, malejący czy stabilny.
-- Sprawdź w sieci aktualną oglądalność tej gry w Polsce i liczbę streamujących ją po polsku (jeśli się da), a także największe wydarzenia na Twitchu dziś.
+- Sprawdź w sieci, ile osób w Polsce ogląda teraz tę grę i ilu streamerów ją streamuje (jeśli się da), oraz największe wydarzenia na Twitchu dziś.
 - Styl: radiowy, lekko komentatorski, angażujący widzów, kobiecy, ale rzeczowy. Krótkie, rytmiczne zdania.
 - Zakończ lekkim CTA: ${ctaTxt}. Ma być nienachalne, naturalne i bez błagania.
-- Długość: tekst do wypowiedzenia ok. 150–180 słów (ok. minuty mówienia). Wyszukaj w sieci maksymalnie 3–4 razy, żeby zmieścić się w czasie.` : `
+- Długość: tekst do wypowiedzenia ok. 150–180 słów (ok. minuty mówienia). Wyszukaj w sieci maksymalnie 4–5 razy (zaplanuj zapytania tak, by jedno obejmowało kalendarz i wydarzenia, a pozostałe grę i Twitcha), żeby zmieścić się w czasie.` : `
 TRYB: STREAM ZAKOŃCZONY / OFFLINE.
 - Ok. 50% wypowiedzi poświęć najnowszej zakończonej sesji: jak poszło, porównanie z historią (z uwzględnieniem czasu trwania), powody odchyleń.
 - Jeśli danych o sesjach jest mało, skup się bardziej na danych kanału poza sesją: liczba followersów, tempo przyrostu w ostatnich 30 dniach, suby, daty najnowszych followów i subów.
 - Pozostałe 50%: wzorce (najlepsze godziny i dni tygodnia, gry, przyczyny), rynek polski, kalendarz, patche/premiery/wydarzenia, stosunek widzów do streamujących dla gier, w które gram.
 - Styl: bardziej analityczny, spokojny, rzeczowy. Bez CTA do widzów.
-- Długość: tekst do wypowiedzenia ok. 280–320 słów (do 2 minut mówienia). Możesz wyszukać w sieci do ok. 8 razy.`;
+- Długość: tekst do wypowiedzenia ok. 280–320 słów (do 2 minut mówienia). Możesz wyszukać w sieci do ok. 10 razy.`;
 
     return `
-Jesteś analitykiem kanału Twitch streamera ${channelName} (polski rynek streamingowy). Poniżej masz wszystkie dane z widżetu, wyliczenia wykonane w kodzie oraz kalendarz Polski.
+Jesteś analitykiem kanału Twitch streamera ${channelName} (polski rynek streamingowy). Poniżej masz wszystkie dane z widżetu, wyliczenia wykonane w kodzie oraz dzisiejszą datę. Kalendarz (święta, dni wolne, wydarzenia) sprawdzasz sam w sieci.
 
 ═══ ZASADY BEZWZGLĘDNE ═══
 1. Nigdy nie czytaj ani nie wymieniaj nicków i nazw użytkowników (poza nazwą ${channelName}). Nigdy nie mów o zarobkach, kwotach, pieniądzach ani przychodach z subskrypcji, bitsów i podobnych. Liczby followersów i subów wolno podawać.
 2. Absolutny zakaz kryptoreklamy: nie wymieniaj nazw firm, portali, serwisów, narzędzi, sklepów, marek ani produktów. Wyjątki: tytuły gier, nazwy studiów i wydawców gier oraz sam Twitch. Źródła opisuj ogólnie (np. „publiczne statystyki Twitcha”), bez nazw stron.
-3. Nigdy nie sugeruj streamerowi zmiany gry ani zmiany godzin lub dni streamowania. INFORMUJ („dane pokazują…”, „w tym oknie konkurencja jest mniejsza”), nie doradzaj zmian i nie używaj zwrotów typu „powinieneś zagrać / przenieść stream”.
+3. Nigdy nie doradzaj streamerowi zmiany gry ani przeniesienia streamowania na inną porę lub dzień (np. „graj wieczorem zamiast rano”). WOLNO natomiast i warto: zauważać zmiany aktywności w trakcie jego streama (np. wzrost widowni około 12:00, spadek około 14:00) i podawać ich prawdopodobne przyczyny (koniec pracy lub dojazd, przerwa obiadowa, lekcje, początek weekendu itp.), a także informować o stosunku streamujących do widzów i o wydarzeniach — jako obserwacje („dane pokazują…”), bez poleceń zmiany.
 4. Prawda, bez słodzenia i bez różowych okularów, ale też bez pesymizmu: szukaj plusów, wspominaj o minusach. Nie zmyślaj liczb. Odróżniaj twarde dane z historii, szacunki (pola zaczynające się od „szac_”) i prognozy/hipotezy. Jeśli czegoś nie da się sprawdzić, powiedz to wprost.
 5. Świeżość: dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Wszystko, co sprawdzasz w sieci, weryfikuj na DZIŚ. Patche, aktualizacje, premiery, zmiany wersji (np. beta→pełna wersja), eventy: wspominaj tylko te, które dzieją się dziś lub w przyszłości (podaj kiedy). Zdarzenia z przeszłości dozwolone tylko do 7 dni wstecz i tylko jeśli realnie wpływają na Twitcha; starsze pomijaj. Jeśli nie potwierdzisz informacji na dziś — nie wspominaj o niej.
+   KALENDARZA NIE MASZ PODANEGO — sam go sprawdź w sieci na podstawie dzisiejszej daty (zob. punkt I).
 6. Dopasuj analizę do polskich widzów i polskiego Twitcha. Statystyki światowe tylko wtedy, gdy są naprawdę istotne.
 7. Zawsze rozpocznij od przedstawienia się jako analityk kanału ${channelName}, powiedz jaki jest dziś dzień i data oraz godzina. Następnie: ${note}
 
 ═══ CO MASZ ANALIZOWAĆ ═══
-A. Wzorce: w jakie gry grał, w jakie dni tygodnia, o której zaczynał i kończył. Wskaż najlepsze godziny i dni (użyj gotowych wyliczeń z "wyliczeniaSerwera", nie licz w pamięci) i szukaj PRZYCZYN: np. piątkowy wieczór — początek weekendu; święto lub dzień wolny; wakacje albo ferie; przedświąteczne przygotowania; pora roku (weekend w wakacje vs. w zimie); duże wydarzenia, które mogły wciągnąć polską widownię (matury, mecze reprezentacji Polski, gale freak-fightowe, finały esportowe, duże premiery). Korzystaj z kalendarza poniżej i weryfikuj w sieci.
-B. Gry: ostatnio streamowane gry mają większą wagę niż stare (waga już policzona w danych) — poświęć im więcej uwagi. Dla tych gier sprawdź w sieci oglądalność w Polsce i w czołówce Twitcha, stosunek liczby widzów do liczby streamujących (mało streamujących, duże zapotrzebowanie = korzystny stosunek) oraz w jakie dni i godziny ten stosunek bywa najlepszy — podaj to wyłącznie jako informację (zasada 3). Sprawdź też patchnote’y, aktualizacje, premiery i duże wydarzenia dotyczące tych gier (zasada 5). Poinformuj też, jaka inna duża gra lub wydarzenie na Twitchu może teraz ściągać widzów (bez sugerowania zmian).
+A. Wzorce: w jakie gry grał, w jakie dni tygodnia, o której zaczynał i kończył. Wskaż najlepsze godziny i dni (użyj gotowych wyliczeń z "wyliczeniaSerwera", nie licz w pamięci) i szukaj PRZYCZYN: np. piątkowy wieczór — początek weekendu; święto lub dzień wolny od pracy; wakacje albo ferie; przedświąteczne przygotowania; pora roku (weekend w wakacje wygląda inaczej niż weekend zimą); duże wydarzenia, które mogły wciągnąć polską widownię (zob. punkt I).
+A2. Wzorce WEWNĄTRZ streama: w osi czasu ("przebieg", każdy punkt ma "godzina" zegarową) oraz w słupkach z "aktualnie" znajdź momenty wzrostu i spadku widowni i czatu, podaj o której godzinie to nastąpiło i wyjaśnij prawdopodobną przyczynę (koniec pracy, dojazd, obiad, lekcje, początek weekendu, rajd, dropy, zmiana gry lub tytułu).
+B. Gry: ostatnio streamowane gry mają większą wagę niż stare (waga już policzona w danych) — poświęć im więcej uwagi. Dla tych gier sprawdź w sieci oglądalność w Polsce i w czołówce Twitcha, stosunek liczby widzów do liczby streamujących (mało streamujących, duże zapotrzebowanie = korzystny stosunek) oraz w jakie dni i godziny ten stosunek bywa najlepszy — podaj to wyłącznie jako informację (zasada 3). Sprawdź też patchnote’y, aktualizacje, premiery i duże wydarzenia dotyczące tych gier (zasada 5). Porównaj oglądalność tej gry z topowymi grami w Polsce. Poinformuj też, jaka inna duża gra lub wydarzenie na Twitchu może teraz ściągać widzów (bez sugerowania zmian).
 C. Tytuł i gra a wyniki: jeśli w tytule jest np. „DROP”/„drops”, zastanów się, czy dropy mogły przyciągnąć widzów; sprawdź w "przebieg" i polach czatu, czy wzrost widowni przełożył się na piszących (unikalni czatujący, wiadomości). Jeśli widzów przybyło, a czat nie drgnął — to widzowie głównie „po nagrody”; jeśli rosły oba — stream faktycznie dobrze trzyma. Rozróżniaj te sytuacje.
 D. Korelacje: więcej widzów + więcej wiadomości = dobry znak; mało widzów, ale obecnych przez większość streama = stabilna publiczność; mało widzów i pisze ta sama grupa osób (wysoki udział czatujących względem unikalnych widzów) = własne grono odbiorców. Wskaż, która z tych sytuacji wygląda na prawdziwą.
 E. Rajdy: pole "skokiWidzow" wskazuje nagłe wzrosty z szybkim odpływem. Jeśli taki wzorzec jest, powiedz, że to prawdopodobnie rajd lub hosting (jako hipoteza, nie fakt), że widownia szybko odpłynęła i jak wygląda widownia „bazowa” bez tego skoku. Nie podawaj nicków.
 F. Czas trwania: nie porównuj sesji 1:1 — dłuższy stream daje inne sumy niż krótszy. Używaj wartości znormalizowanych (na godzinę) z "porownanieNajnowszejSesji" i wspominaj o różnicy długości.
 G. Tempo rozwoju: ile followersów przybyło w ostatnich 30 dniach i jaki to wzrost procentowy, ile saldo po odliczeniu unfollowów, jak wyglądają suby (nowe i wygasłe), kiedy wpadł ostatni follow i ostatni sub. Zauważ i nazwij dobry okres, jeśli suby/followersi rosną. Zaznacz, że część danych subów jest przybliżona, jeśli widżet działa krótko.
 H. Za każdym razem szukaj PRZYCZYN odchyleń, a nie samego „o 5% więcej niż zwykle”: lepszy stream, lepsza godzina, dzień wolny, gra, wydarzenie zewnętrzne, rajd, dropy.
+I. KALENDARZ I WYDARZENIA — sprawdź SAM w sieci, na podstawie dzisiejszej daty (nic nie jest wgrane): czy dziś lub w najbliższych dniach jest święto państwowe, dzień wolny od pracy, długi weekend lub „most”; czy to weekend w wakacje, w ferie (ferie zimowe sprawdź z podziałem na województwa, jeśli to ich okres), w zimie czy poza sezonem; czy trwają przygotowania świąteczne lub inny okres obniżonej oglądalności. Sprawdź też wydarzenia, które w Polsce masowo odciągają widzów z Twitcha: matury i egzaminy, mecze reprezentacji Polski, duże gale freak-fightowe, finały dużych turniejów e-sportowych (np. IEM Katowice) oraz inne ważne premiery i wydarzenia. Wspominaj wyłącznie to, co potwierdziłeś dla dzisiejszej daty (zasada 5), i wyjaśnij, jak mogło to wpłynąć na widownię.
 ${modeBlock}
 
 ═══ DANE ═══
-KALENDARZ POLSKI (liczony w kodzie, pewny):
+DZISIEJSZA DATA (z zegara serwera, czas polski) — święta, dni wolne i wydarzenia sprawdzasz sam w sieci:
 ${JSON.stringify(cal, null, 2)}
 
 CZAS I STAN TERAZ (z widżetu):
@@ -351,32 +305,41 @@ function pickAudio(i) {
 }
 
 // Gemini 3.8 TTS działa przez Interactions API: tekst w input, głos w generation_config.speech_config, format w response_format.
-// Najpierw próbujemy ze stylem właściwym dla trybu (live = radiowy, offline = analityczny), a gdyby model odrzucił styl — bez stylu.
+// Styl (live = radiowy, offline = analityczny) próbujemy z krótkim limitem czasu. Jeśli zawiedzie (błąd, brak audio, timeout),
+// OD RAZU wracamy do sprawdzonego wariantu bez stylu — i przez 10 minut nie marnujemy czasu na styl. Dzięki temu styl nigdy nie zagłuszy głosu.
+let styleOffUntil = 0;
+const STYLE_TIMEOUT_MS = Number(process.env.TTS_STYLE_TIMEOUT_MS) || 20000;
 async function makeAudio(text, models = TTS_MODELS, mode = 'offline') {
     let lastErr = null;
-    const styles = [TTS_STYLES[mode] || TTS_STYLES.offline, null];
+    const style = TTS_STYLES[mode] || TTS_STYLES.offline;
     for (const model of models) {
-        for (const style of styles) {
+        const attempts = Date.now() < styleOffUntil ? [null] : [style, null];
+        for (const st of attempts) {
             try {
                 const part = { type: 'text', text };
-                if (style) part.annotations = [{ type: 'speech_metadata', style }];
+                if (st) part.annotations = [{ type: 'speech_metadata', style: st }];
                 const interaction = await withTimeout(ai.interactions.create({
                     model,
                     input: [{ type: 'user_input', content: [part] }],
                     response_format: { type: 'audio' },
                     generation_config: { speech_config: [{ voice: TTS_VOICE }] }
-                }), 30000, `TTS ${model}`);
+                }), st ? STYLE_TIMEOUT_MS : 30000, `TTS ${model}`);
                 const b64 = pickAudio(interaction);
-                if (!b64) { lastErr = new Error(`TTS ${model}: brak audio w odpowiedzi`); continue; }
+                if (!b64) {
+                    lastErr = new Error(`TTS ${model}: brak audio w odpowiedzi`);
+                    if (st) { styleOffUntil = Date.now() + 10 * 60e3; console.error(`TTS (${model}) ze stylem bez audio — wyłączam styl na 10 min`); continue; }
+                    break;
+                }
                 const buf = Buffer.from(b64, 'base64');
                 // unary zwraca gotowy WAV (RIFF); gdyby przyszedł surowy PCM — dopinamy nagłówek
                 const out = buf.slice(0, 4).toString('ascii') === 'RIFF' ? buf : pcmToWav(buf);
-                console.log(`TTS OK: ${model}${style ? ` (styl: ${mode})` : ''}`);
+                console.log(`TTS OK: ${model}${st ? ` (styl: ${mode})` : ' (bez stylu)'}`);
                 return out.toString('base64');
             } catch (e) {
                 lastErr = e;
-                console.error(`TTS (${model}${style ? ', ze stylem' : ''}) nie zadziałał:`, e.message);
-                if (/przekroczono limit/.test(e.message)) break; // timeout → następny model
+                console.error(`TTS (${model}${st ? ', ze stylem' : ', bez stylu'}) nie zadziałał:`, e.message);
+                if (st) { styleOffUntil = Date.now() + 10 * 60e3; continue; } // styl zawiódł → natychmiast wariant bez stylu
+                break; // bez stylu też się nie udało → następny model
             }
         }
     }
@@ -409,9 +372,6 @@ app.get('/diag', async (req, res) => {
     ]);
     res.json(out);
 });
-
-// Podgląd kalendarza i wyliczeń (bez wywołania modelu): /calendar
-app.get('/calendar', (req, res) => res.json(calendarContext()));
 
 // Strona testowa głosu: /tts-test  (opcjonalnie ?model=...&text=...&mode=live|offline)
 app.get('/tts-test', async (req, res) => {
@@ -458,7 +418,7 @@ app.post('/api/analyze', async (req, res) => {
 
         const cal = calendarContext();
         const derived = derive(currentSession, sessionsHistory);
-        const prompt = buildPrompt({ ...body, live }, cal, derived);
+        const prompt = buildPrompt({ ...body, live, currentSession: withClock(currentSession), sessionsHistory: sessionsHistory.map(withClock) }, cal, derived);
         const lim = LIMITS[mode], think = THINK[mode];
 
         // UWAGA: wyszukiwanie Google nie działa razem z wymuszonym JSON — JSON parsujemy ręcznie
@@ -468,7 +428,7 @@ app.post('/api/analyze', async (req, res) => {
             searchUsed = true;
         } catch (e) { lastErr = e; console.error('Analiza z wyszukiwaniem nie wyszła:', e.message); }
         if (!result) {
-            const fallbackPrompt = prompt + '\n\nUWAGA: wyszukiwarka jest teraz niedostępna. Opieraj się wyłącznie na przesłanych danych i kalendarzu, a w częściach wymagających sieci (gry, patche, wydarzenia, stosunek widzów do streamujących) powiedz krótko, że bieżących danych z sieci nie udało się sprawdzić. Niczego nie zmyślaj.';
+            const fallbackPrompt = prompt + '\n\nUWAGA: wyszukiwarka jest teraz niedostępna. Opieraj się wyłącznie na przesłanych danych i dzisiejszej dacie, a w częściach wymagających sieci (kalendarz i święta, gry, patche, wydarzenia, stosunek widzów do streamujących) powiedz krótko, że bieżących danych z sieci nie udało się sprawdzić. Niczego nie zmyślaj.';
             try { result = await genRace(fallbackPrompt, false, lim.fallback, 'low'); }
             catch (e) { lastErr = e; console.error('Analiza bez wyszukiwania nie wyszła:', e.message); }
         }
