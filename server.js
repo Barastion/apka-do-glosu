@@ -17,21 +17,23 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 //        Żeby użyć list z kodu, usuń te zmienne w Render.
 //
 // ANALIZA (najważniejsza; bez wyszukiwania). Limity dzienne z ai.dev/rate-limit:
-//   3.8-flash (20) → 3.6-flash (20) → 4-hydrogen (20, jakość nieznana — przesuń w env, jeśli wypadnie gorzej) → 3-flash (20)
-//   → 3.5-flash-lite (500) → 3.1-flash-lite (500) → 2.5-flash (20) → 2.5-flash-lite (20)
-//   → robotics-er-2 (20, ostatnia deska ratunku) → Gemma 4 31B / 26B (po 14,4 tys./dobę, ale tylko 16 tys. tokenów/min — ostatnie warstwy).
-// ID modeli oznaczone „sprawdź ID” są domyślne: jeśli któregoś nie ma na koncie (404), serwer pominie go na 6 h bez żadnych strat.
+//   3.8-flash (20) → 3.6-flash (20) → 4-hydrogen (20, potwierdzony w logach) → 3-flash (20) → 3.5-flash-lite (500) → 3.1-flash-lite (500)
+//   → Gemma 4 31B / 26B (po 14,4 tys./dobę, ale tylko 16 tys. tokenów/min — ostatnie warstwy).
+// Gemini 2.5 (flash i flash-lite) jest na tym koncie WYŁĄCZONY (404 „no longer available to new users”), więc go tu nie ma.
+// Gemini Robotics ER 2 celowo NIE jest na liście analizy: jego 20 zapytań dziennie są zarezerwowane dla wyszukiwania w sieci (limit dzienny dotyczy modelu, nie narzędzia).
+// Pozycja 4-hydrogen to przypuszczenie co do jakości — jeśli analizy z niego wypadną gorzej, przesuń go niżej (env TEXT_MODEL_FALLBACKS).
+// ID modeli 3-flash-preview i gemma-4-* nie były jeszcze potwierdzone: gdy któregoś nie ma (404), serwer pominie go na 6 h.
 const TEXT_MODEL = process.env.TEXT_MODEL || 'gemini-3.8-flash';
 const list = (v, def) => String(v || def).split(',').map(x => x.trim()).filter(Boolean);
 const TEXT_MODELS = [...new Set([TEXT_MODEL, ...list(process.env.TEXT_MODEL_FALLBACKS || process.env.TEXT_MODEL_FALLBACK,
-    'gemini-3.6-flash,gemini-4-hydrogen,gemini-3-flash-preview,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash,gemini-2.5-flash-lite,gemini-robotics-er-2-preview,gemma-4-31b-it,gemma-4-26b-a4b-it')])];   // sprawdź ID: 4-hydrogen, 3-flash-preview, robotics-er-2-preview, gemma-4-*
+    'gemini-3.6-flash,gemini-4-hydrogen,gemini-3-flash-preview,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemma-4-31b-it,gemma-4-26b-a4b-it')])];   // sprawdź ID: 3-flash-preview, gemma-4-*
 // GŁOS (bez zmian): główny + zapasowe, od najlepszego do najsłabszego; każdy model TTS ma osobny limit dzienny (po 10). Env: TTS_MODEL, TTS_MODEL_FALLBACKS.
 const TTS_MODELS = [...new Set([process.env.TTS_MODEL || 'gemini-3.8-flash-tts', ...list(process.env.TTS_MODEL_FALLBACKS, 'gemini-3.8-flash-lite-tts,gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts')])];
 const TTS_VOICE = process.env.TTS_VOICE || 'Kore';
-// BADANIE SIECI (wyszukiwanie; to tylko dodatek do analizy). Na Twoim koncie narzędzie Google Search działa WYŁĄCZNIE na modelach 2.5
-// (limit „Search grounding”: Gemini 2.5 = 1,5 tys./dobę, „Gemini 3 and newer” = 0/0), więc modele 3.x i 4 są stąd usunięte — dawały tylko odrzucenia.
-// Kolejność: 2.5-flash (5/min, 20/dobę) → 2.5-flash-lite (10/min, 20/dobę) → robotics-er-2 (eksperyment: gdy nie obsługuje wyszukiwania, zostanie pominięty na 6 h).
-const RESEARCH_MODELS = [...new Set(list(process.env.RESEARCH_MODELS, 'gemini-2.5-flash,gemini-2.5-flash-lite,gemini-robotics-er-2-preview'))];
+// BADANIE SIECI (wyszukiwanie; to tylko dodatek do analizy). Z logów: jedyny potwierdzony model z działającym wyszukiwaniem to Gemini Robotics ER 2 (ok. 12 s).
+// Gemini 2.5 jest wyłączony (404), a modele 3.x mają w tabeli limit wyszukiwania 0/0, więc ich tu nie ma.
+// Kolejność: robotics-er-2 (sprawdzony) → 4-hydrogen (niepotwierdzony; użyty tylko gdy robotics zawiedzie). Kolejne kandydaty sprawdzisz przez /diag?search=1&models=a,b,c
+const RESEARCH_MODELS = [...new Set(list(process.env.RESEARCH_MODELS, 'gemini-robotics-er-2-preview,gemini-4-hydrogen'))];
 // modele, które nie przyjmują poziomu „myślenia” (Gemma, seria 2.5) — nie wysyłamy go, żeby nie marnować zapytań na odrzucenia
 const noThink = m => /gemma|2\.5/i.test(m);
 
@@ -1148,7 +1150,8 @@ app.get('/diag', async (req, res) => {
         catch (e) { return { label, ok: false, ms: Date.now() - t0, error: e.message }; }
     };
     // /diag?search=1 dodatkowo testuje modele wyszukiwania (zużywa po 1 zapytaniu z limitu wyszukiwania na model)
-    const searchTests = req.query.search ? RESEARCH_MODELS.map(m => timed('sieć ' + m, () => genOne('Podaj jednym zdaniem dzisiejszą datę w Polsce.', true, 60000, m, 'low'))) : [];
+    const searchList = req.query.models ? list(req.query.models, '') : RESEARCH_MODELS;
+    const searchTests = req.query.search ? searchList.map(m => timed('sieć ' + m, () => genOne('Podaj jednym zdaniem dzisiejszą datę w Polsce.', true, 60000, m, 'low'))) : [];
     const out = await Promise.all([
         ...TEXT_MODELS.map(m => timed('tekst ' + m, () => genOne('Odpowiedz jednym słowem: ok', false, 45000, m, 'low'))),
         ...searchTests,
