@@ -814,14 +814,14 @@ function researchPrompt(cal, games) {
 1. POLSKA (najważniejsze): duże wydarzenia w Polsce na dziś lub nadchodzący tydzień; w tym dodatkowe dni wolne lub zmiany w kalendarzu świąt, jeśli są. Osobno SPORT: duże wydarzenia sportowe w Polsce na dziś lub nadchodzący tydzień (mecze, turnieje, gale).
 2. TWITCH: największe wydarzenia na Twitchu oraz najpopularniejsze gry na polskim Twitchu teraz.
 3. GRY: ważne premiery i głośne wydarzenia ze świata gier.
-${games.length ? `4. GRA STREAMERA (na końcu): ${games.join('; ')} — patche, aktualizacje, eventy i dropy; ilu widzów w Polsce ją ogląda i ilu streamuje.\n` : ''}Przy każdym wydarzeniu podaj dzień i porę lub godzinę, jeśli są znane. Szukaj od punktu 1; jeśli zabraknie wyszukiwań, niższe punkty pomiń. Odpowiedz krótkimi punktami „POLSKA”, „SPORT”, „TWITCH”, „GRY”${games.length ? ', „GRA”' : ''} (łącznie ok. 150 słów). Wpisz tylko to, co udało się potwierdzić; sekcji bez potwierdzonych faktów w ogóle nie wypisuj (żadnych „brak danych”). Nie zmyślaj liczb. Bez nazw firm, portali i serwisów (wyjątek: gry, studia, wydawcy, Twitch) i bez linków.`;
+${games.length ? `4. GRA STREAMERA (na końcu): ${games.join('; ')} — patche, aktualizacje, eventy i dropy; ilu widzów w Polsce ją ogląda i ilu streamuje.\n` : ''}Przy każdym wydarzeniu podaj dzień i porę lub godzinę, jeśli są znane.${games.length ? ' Wydarzenie dotyczące gier streamera (też pod inną nazwą lub wersją: klasyczna, dodatek, nowy serwer) oznacz „[GRA STREAMERA]”.' : ''} Szukaj od punktu 1; jeśli zabraknie wyszukiwań, niższe punkty pomiń. Odpowiedz krótkimi punktami „POLSKA”, „SPORT”, „TWITCH”, „GRY”${games.length ? ', „GRA”' : ''} (łącznie ok. 150 słów). Wpisz tylko to, co udało się potwierdzić; sekcji bez potwierdzonych faktów w ogóle nie wypisuj (żadnych „brak danych”). Nie zmyślaj liczb. Bez nazw firm, portali i serwisów (wyjątek: gry, studia, wydawcy, Twitch) i bez linków.`;
 }
 function pickGames(body) {
     const seen = [], add = g => { if (g && typeof g === 'string' && !seen.some(x => x.toLowerCase() === g.toLowerCase())) seen.push(g.trim()); };
     const cur = body.currentSession;
     add(body.teraz?.gra); add(cur?.glownaGra); (cur?.gry || []).slice(0, 2).forEach(x => add(x.nazwa));
-    (body.sessionsHistory || []).slice(0, 2).forEach(s => add(s.glownaGra));
-    return seen.slice(0, 3);
+    (body.sessionsHistory || []).slice(0, 10).forEach(s => add(s.glownaGra));
+    return seen.slice(0, 5);
 }
 
 // Ostatnie udane badanie sieci: używane TYLKO gdy świeże się nie uda (np. limit Gemini), wyłącznie z tej samej doby i do 12 h.
@@ -839,9 +839,10 @@ async function research(body, cal, mode) {
         date = cal.dzis.dataISO;
         const games = pickGames(body);
         gk = games.map(x => x.toLowerCase()).sort().join('+');
-        const key = `net|v6|${date}|${gk}`;   // ważne 12 h w ciągu tej samej doby, osobno dla danego zestawu gier
+        const key = `net|v7|${date}|${gk}`;   // ważne 12 h w ciągu tej samej doby, osobno dla danego zestawu gier
         const r = await cacheMain.memo(key, TTL.games, async () => {
             const x = await genSeq(researchPrompt(cal, games), true, RESEARCH_MS, 'low', RESEARCH_MODELS, 4, Date.now() + RESEARCH_BUDGET_MS, x => !!String(x?.text || '').trim());
+            console.log(`Badanie sieci: gry=[${games.join('; ')}] model=${x.model} blok: ${String(x.text || '').replace(/\s+/g, ' ').slice(0, 1200)}`);
             lastNet = { date, gk, text: x.text?.trim() || '', sources: x.sources || [], at: Date.now() };
             return x;
         });
@@ -1012,7 +1013,7 @@ function buildPrompt(body, cal, derived, ctx) {
 5. Ton pozytywny, ale prawdziwy: mów o tym, co poszło dobrze, i o tym, co poszło słabo. Nie szukaj plusów na siłę i nie ukrywaj minusów.
 6. Nie zmyślaj liczb. Odróżniaj twarde dane, szacunki (pola „szac_”) i hipotezy; czego nie da się sprawdzić, powiedz wprost. Grupy z polem „uwaga” (jedna lub dwie sesje) to ciekawostka, nie wzorzec. Przy małej próbie („wiarygodnosc”) mów ostrożnie, ale nadal wskaż najlepsze.
 7. Mów do polskich widzów o polskim Twitchu. Wydarzenia wspominaj tylko z bloku KONTEKST Z SIECI (dzisiejsze, przyszłe lub z ostatnich 7 dni) oraz z KALENDARZA; niepotwierdzonego nie dodawaj. Blok sieci jest ułożony od najważniejszego: Polska i sport, potem Twitch, potem gry, na końcu patche i oglądalność gry streamera. Mów o tym, co w nim jest, zaczynając od najważniejszego; o tym, czego w bloku nie ma, nie wspominaj i nie mów, że czegoś nie udało się sprawdzić.
-8. Wydarzenia i pora jako możliwe przyczyny (hipotezy, nie fakty): wydarzenie z KONTEKSTU Z SIECI lub z KALENDARZA rozważ jako przyczynę zmiany widowni, jeśli jego pora pasuje do godzin streama z danych. Wydarzenie sportowe lub inne masowe wieczorem zwykle odciąga widzów (mniej widzów); dzień wolny i święto całodniowe zwykle zwiększają widownię, ale i liczbę streamujących, czyli konkurencję; piątkowy wieczór i weekend działają podobnie; duża premiera lub głośne wydarzenie innej gry niż streamowana odciąga widownię na inny tytuł; patch, event lub dropy w streamowanej grze mogą widownię zwiększyć. Powiąż to z kierunkiem zmiany w danych; gdy wyniki nie pokazują efektu, nie wymyślaj go. Opis miesiąca i pory roku to ogólne tło, nie wydarzenie: nie podawaj go jako newsa, używaj go tylko jako możliwego wyjaśnienia. Bez danych z sieci opieraj się na kalendarzu i porze.
+8. Wydarzenia i pora jako możliwe przyczyny (hipotezy, nie fakty): wydarzenie z KONTEKSTU Z SIECI lub z KALENDARZA rozważ jako przyczynę zmiany widowni, jeśli jego pora pasuje do godzin streama z danych. Wydarzenie sportowe lub inne masowe wieczorem zwykle odciąga widzów (mniej widzów); dzień wolny i święto całodniowe zwykle zwiększają widownię, ale i liczbę streamujących, czyli konkurencję; piątkowy wieczór i weekend działają podobnie; duża premiera lub głośne wydarzenie innej gry niż streamowana odciąga widownię na inny tytuł; wydarzenie ze znacznikiem „[GRA STREAMERA]” dotyczy gry streamera — to wpływ na jego własną grę: zwykle więcej widzów, ale i więcej streamujących (większa konkurencja); powiąż to z danymi i nie rozstrzygaj na siłę; znacznika nie wymawiaj; patch, event lub dropy w streamowanej grze mogą widownię zwiększyć. Powiąż to z kierunkiem zmiany w danych; gdy wyniki nie pokazują efektu, nie wymyślaj go. Opis miesiąca i pory roku to ogólne tło, nie wydarzenie: nie podawaj go jako newsa, używaj go tylko jako możliwego wyjaśnienia. Bez danych z sieci opieraj się na kalendarzu i porze.
 
 ═══ LICZBY I CZAS ═══
 9. Słuchacz słyszy tekst raz. Najpierw wniosek własnymi słowami, potem liczba, która go potwierdza, z jej znaczeniem. Najwyżej jedna–dwie liczby w zdaniu, nigdy kilka procentów pod rząd. Zaokrąglaj jak w mowie; dokładnie tylko czas trwania i godziny. Nie czytaj nazw pól, indeksów ani współczynników. Wybierz to, co najważniejsze, resztę pomiń.
@@ -1191,7 +1192,7 @@ app.post('/api/analyze', async (req, res) => {
     try {
         const body = normalizeBody(req.body || {});   // nowa paczka w blokach lub stara — dalej zawsze ten sam układ
         const { sessionsHistory = [], currentSession = null, channelName = 'Dolaricious', noData = false, kanal = {}, teraz = {} } = body;
-        const PROMPT_V = 'v7';   // zmieniaj po edycji promptu, żeby stare analizy z pamięci podręcznej nie wracały
+        const PROMPT_V = 'v9';   // zmieniaj po edycji promptu, żeby stare analizy z pamięci podręcznej nie wracały
         const live = body.tryb === 'live' || (body.tryb == null && !!currentSession?.trwaJeszcze);
         const mode = live ? 'live' : 'offline';
 
