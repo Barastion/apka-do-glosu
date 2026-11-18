@@ -806,14 +806,14 @@ function lastSessionNote(current, cal, live, history = []) {
 // ═══════════════ BADANIE SIECI (z pamięcią podręczną) ═══════════════
 // Kalendarz (zwykłe święta, dni wolne, długie weekendy, pora roku) liczy serwer, więc sieć sprawdza tylko to, czego kod nie wie.
 // Jedno zapytanie, maks. 3 wyszukiwania, pamięć podręczna 12 h (klucz: doba + zestaw gier). Analiza końcowa nie używa wyszukiwarki.
-// KOLEJNOŚĆ WAŻNOŚCI (od najważniejszej): 1) Polska: wydarzenia + sport (w tym dodatkowe dni wolne, żałoba, zmiany w kalendarzu świąt),
+// KOLEJNOŚĆ WAŻNOŚCI (od najważniejszej): 1) Polska: wydarzenia + sport (w tym dodatkowe dni wolne, zmiany w kalendarzu świąt),
 // 2) Twitch: wydarzenia + najpopularniejsze gry, 3) świat gier: premiery i głośne wydarzenia, 4) gra streamera: patche, oglądalność.
 // Do analizy trafia tylko to, co udało się potwierdzić; sekcje bez wyniku są pomijane.
 function researchPrompt(cal, games) {
     return `Dziś jest ${cal.dzis.dzienTygodnia}, ${cal.dzis.data}, godz. ${cal.dzis.godzina} (czas polski). Zbierz w sieci informacje dla DZISIAJ i NAJBLIŻSZYCH 7 DNI, w poniższej kolejności ważności, używając maksymalnie 3 wyszukiwań. Zwykłe święta ustawowe, weekendy, długie weekendy i pory roku są już policzone — ich NIE sprawdzaj.
 1. POLSKA (najważniejsze): duże wydarzenia w Polsce na dziś lub nadchodzący tydzień; w tym dodatkowe dni wolne lub zmiany w kalendarzu świąt, jeśli są. Osobno SPORT: duże wydarzenia sportowe w Polsce na dziś lub nadchodzący tydzień (mecze, turnieje, gale).
 2. TWITCH: największe wydarzenia na Twitchu oraz najpopularniejsze gry na polskim Twitchu teraz.
-3. GRY: ważne premiery i głośne wydarzenia ze świata gier.
+3. GRY: ważne premiery i głośne wydarzenia ze świata gier i esportu, które mogą przeciągnąć widzów do innej gry lub na inne kanały.
 ${games.length ? `4. GRA STREAMERA (na końcu): ${games.join('; ')} — patche, aktualizacje, eventy i dropy; ilu widzów w Polsce ją ogląda i ilu streamuje.\n` : ''}Przy każdym wydarzeniu podaj dzień i porę lub godzinę, jeśli są znane.${games.length ? ' Wydarzenie dotyczące gier streamera (też pod inną nazwą lub wersją: klasyczna, dodatek, nowy serwer) oznacz „[GRA STREAMERA]”.' : ''} Szukaj od punktu 1; jeśli zabraknie wyszukiwań, niższe punkty pomiń. Odpowiedz krótkimi punktami „POLSKA”, „SPORT”, „TWITCH”, „GRY”${games.length ? ', „GRA”' : ''} (łącznie ok. 150 słów). Wpisz tylko to, co udało się potwierdzić; sekcji bez potwierdzonych faktów w ogóle nie wypisuj (żadnych „brak danych”). Nie zmyślaj liczb. Bez nazw firm, portali i serwisów (wyjątek: gry, studia, wydawcy, Twitch) i bez linków.`;
 }
 function pickGames(body) {
